@@ -39,10 +39,13 @@
 
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// A trait for types that can be used as subnets.
 pub trait Subnet: PartialOrd + Ord + PartialEq + Copy + std::fmt::Debug {
+    /// The address type for the subnet.
+    type Address: Copy + std::fmt::Debug;
+
     /// Get the prefix length of the subnet.
     fn prefix(self) -> u8;
 
@@ -59,9 +62,17 @@ pub trait Subnet: PartialOrd + Ord + PartialEq + Copy + std::fmt::Debug {
 
     /// Toggle the bit at the given index.
     fn toggle_bit(self, index: u8) -> Self;
+
+    /// Address size in bits.
+    fn addr_size(self) -> u8;
+
+    /// Get the host address of the subnet.
+    fn network(self) -> Self::Address;
 }
 
 impl Subnet for Ipv4Network {
+    type Address = Ipv4Addr;
+
     fn prefix(self) -> u8 {
         Ipv4Network::prefix(self)
     }
@@ -92,9 +103,19 @@ impl Subnet for Ipv4Network {
         ip ^= 1 << (31 - index);
         Self::new(Ipv4Addr::from_bits(ip), self.prefix()).unwrap()
     }
+
+    fn addr_size(self) -> u8 {
+        32
+    }
+
+    fn network(self) -> Ipv4Addr {
+        self.network()
+    }
 }
 
 impl Subnet for Ipv6Network {
+    type Address = Ipv6Addr;
+
     fn prefix(self) -> u8 {
         Ipv6Network::prefix(&self)
     }
@@ -125,9 +146,19 @@ impl Subnet for Ipv6Network {
         ip ^= 1 << (127 - index);
         Self::new(Ipv6Addr::from_bits(ip), self.prefix()).unwrap()
     }
+
+    fn addr_size(self) -> u8 {
+        128
+    }
+
+    fn network(self) -> Ipv6Addr {
+        self.network()
+    }
 }
 
 impl Subnet for IpNetwork {
+    type Address = IpAddr;
+
     fn prefix(self) -> u8 {
         match self {
             IpNetwork::V4(net) => net.prefix(),
@@ -160,6 +191,20 @@ impl Subnet for IpNetwork {
         match self {
             IpNetwork::V4(net) => IpNetwork::V4(net.toggle_bit(index)),
             IpNetwork::V6(net) => IpNetwork::V6(net.toggle_bit(index)),
+        }
+    }
+
+    fn addr_size(self) -> u8 {
+        match self {
+            IpNetwork::V4(_) => 32,
+            IpNetwork::V6(_) => 128,
+        }
+    }
+
+    fn network(self) -> IpAddr {
+        match self {
+            IpNetwork::V4(net) => IpAddr::V4(net.network()),
+            IpNetwork::V6(net) => IpAddr::V6(net.network()),
         }
     }
 }
@@ -416,6 +461,15 @@ impl<N: Subnet, T> IpTable<N, T> {
     ) -> impl Iterator<Item = N> + use<'_, N, T> {
         self.iter_gaps(prefix, Some(prefix_len))
             .flat_map(move |prefix| iter_exact_prefixes(prefix, prefix_len))
+    }
+
+    /// Find all unassigned IPs in the given prefix.
+    pub fn iter_gap_ips_in_prefix(
+        &self,
+        prefix: N,
+    ) -> impl Iterator<Item = N::Address> + use<'_, N, T> {
+        self.iter_gaps_with_prefix_len(prefix, prefix.addr_size())
+            .map(|net| net.network())
     }
 }
 
@@ -749,6 +803,16 @@ mod tests {
         );
         assert_eq!(
             "192.168.2.3/32".parse::<IpNetwork>().unwrap(),
+            gaps.next().unwrap()
+        );
+
+        let mut gaps = table.iter_gap_ips_in_prefix(net);
+        assert_eq!(
+            "192.168.2.0".parse::<IpAddr>().unwrap(),
+            gaps.next().unwrap()
+        );
+        assert_eq!(
+            "192.168.2.1".parse::<IpAddr>().unwrap(),
             gaps.next().unwrap()
         );
     }
