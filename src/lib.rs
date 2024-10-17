@@ -45,7 +45,7 @@ pub trait Subnet: PartialOrd + Ord + PartialEq + Copy + std::fmt::Debug {
     /// Create a new subnet that is a copy of this one with a different prefix.
     ///
     /// The host bits are set to 0.
-    fn with_prefix(self, prefix: u8) -> Self;
+    fn with_prefix_len(self, prefix: u8) -> Self;
 }
 
 impl Subnet for Ipv4Network {
@@ -64,7 +64,7 @@ impl Subnet for Ipv4Network {
         Ipv4Network::is_subnet_of(self, other)
     }
 
-    fn with_prefix(self, prefix: u8) -> Self {
+    fn with_prefix_len(self, prefix: u8) -> Self {
         assert!(prefix <= 32);
         let mut ip = self.ip().to_bits();
         for i in prefix..32 {
@@ -91,7 +91,7 @@ impl Subnet for Ipv6Network {
         Ipv6Network::is_subnet_of(self, other)
     }
 
-    fn with_prefix(self, prefix: u8) -> Self {
+    fn with_prefix_len(self, prefix: u8) -> Self {
         assert!(prefix <= 128);
         let mut ip = self.ip().to_bits();
         for i in prefix..128 {
@@ -124,10 +124,10 @@ impl Subnet for IpNetwork {
         }
     }
 
-    fn with_prefix(self, prefix: u8) -> Self {
+    fn with_prefix_len(self, prefix: u8) -> Self {
         match self {
-            IpNetwork::V4(net) => IpNetwork::V4(net.with_prefix(prefix)),
-            IpNetwork::V6(net) => IpNetwork::V6(net.with_prefix(prefix)),
+            IpNetwork::V4(net) => IpNetwork::V4(net.with_prefix_len(prefix)),
+            IpNetwork::V6(net) => IpNetwork::V6(net.with_prefix_len(prefix)),
         }
     }
 }
@@ -221,7 +221,7 @@ impl<N: Subnet, T> IpTable<N, T> {
 
         for (net, value) in self.0.into_iter() {
             if net.prefix() >= target_prefix {
-                let net = net.with_prefix(target_prefix);
+                let net = net.with_prefix_len(target_prefix);
 
                 // If the entry already exists, merge the values
                 if let Some(existing_value) = new_table.remove(net) {
@@ -247,7 +247,7 @@ impl<N: Subnet, T> IpTable<N, T> {
     pub fn iter_containing_prefixes<S: Into<N>>(&self, net: S) -> impl Iterator<Item = (N, &T)> {
         let net: N = net.into();
         (0..net.prefix()).rev().filter_map(move |i| {
-            let parent = net.with_prefix(i);
+            let parent = net.with_prefix_len(i);
             self.get(parent).map(|value| (parent, value))
         })
     }
