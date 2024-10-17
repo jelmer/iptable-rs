@@ -19,6 +19,16 @@
 //! let relevant = table.iter_prefix(ipnet).collect::<Vec<_>>();
 //! assert_eq!(2, relevant.len());
 //!
+//! // Find unassigned /20s in the table
+//! let unassigned = table.iter_gaps(
+//!     "192.168.0.0/18".parse::<Ipv4Network>().unwrap(), Some(20))
+//!     .collect::<Vec<_>>();
+//!
+//! assert_eq!(
+//!    unassigned, vec![
+//!        "192.168.32.0/19".parse().unwrap(),
+//!        "192.168.16.0/20".parse().unwrap()]);
+//!
 //! // Merge entries with longer prefixes
 //! let merged_table = table.merge_longer_prefixes(16, |a, b| a + b);
 //! assert_eq!(
@@ -303,6 +313,100 @@ impl<N: Subnet, T> IpTable<N, T> {
             self.get(parent).map(|value| (parent, value))
         })
     }
+
+    /// Update the table with the given iterator.
+    pub fn update<I: IntoIterator<Item = (N, T)>>(&mut self, iter: I) {
+        for (net, value) in iter {
+            self.insert(net, value);
+        }
+    }
+
+    /// Iterate over the gaps in the table.
+    ///
+    /// # Arguments
+    /// * `prefix` - The prefix under which to find gaps
+    /// * `max_prefix` - The maximum prefix length to yield
+    ///
+    /// # Example
+    /// ```
+    /// use iptable::UniversalIpTable;
+    /// use ipnetwork::IpNetwork;
+    /// let mut table = UniversalIpTable::new();
+    /// table.insert("192.168.2.0/24".parse::<IpNetwork>().unwrap(), 42);
+    /// table.insert("192.168.2.128/25".parse::<IpNetwork>().unwrap(), 43);
+    ///
+    /// let gaps = table.iter_gaps("192.168.0.0/18".parse::<IpNetwork>().unwrap(), Some(20))
+    ///    .collect::<Vec<_>>();
+    /// assert_eq!(
+    ///     gaps, vec![
+    ///         "192.168.32.0/19".parse().unwrap(),
+    ///         "192.168.16.0/20".parse().unwrap()]);
+    /// ```
+    pub fn iter_gaps<S: Into<N>>(
+        &self,
+        prefix: S,
+        max_prefix: Option<u8>,
+    ) -> impl Iterator<Item = N> + use<'_, S, N, T> {
+        let prefix: N = prefix.into();
+
+        let mut to_yield = vec![];
+        let mut todo = vec![prefix];
+        // for each side, check if it is in the table
+        // if it has some children in the table, add it to the todo list
+        // if it has no children in the table, yield it
+        std::iter::from_fn(move || {
+            if let Some(y) = to_yield.pop() {
+                return Some(y);
+            }
+
+            while let Some(prefix) = todo.pop() {
+                // If the prefix nor any children are in the table, yield it
+                if self.iter_prefix(prefix).next().is_none() {
+                    return Some(prefix);
+                }
+
+                if prefix.prefix() + 1 > max_prefix.unwrap_or(u8::MAX) {
+                    continue;
+                }
+
+                let a = prefix.with_prefix_len(prefix.prefix() + 1);
+                let b = prefix
+                    .toggle_bit(prefix.prefix())
+                    .with_prefix_len(prefix.prefix() + 1);
+
+                match self.iter_prefix(a).next() {
+                    // If a is in the table, we don't need to check it further
+                    Some((n, _)) if *n == a => {}
+                    // a is not in the children, but it has children. need to check further
+                    Some(_) => {
+                        todo.push(a);
+                    }
+                    // a is not in the table, and has no children. yield it
+                    Option::None => {
+                        to_yield.push(a);
+                    }
+                }
+
+                match self.iter_prefix(b).next() {
+                    // If b is in the table, we don't need to check it further
+                    Some((n, _)) if *n == b => {}
+                    // b is not in the children, but it has children. need to check further
+                    Some(_) => {
+                        todo.push(b);
+                    }
+                    // b is not in the table, and has no children. yield it
+                    Option::None => {
+                        to_yield.push(b);
+                    }
+                }
+
+                if let Some(y) = to_yield.pop() {
+                    return Some(y);
+                }
+            }
+            None
+        })
+    }
 }
 
 /// Find all gaps in prefix before the given child prefix.
@@ -348,6 +452,28 @@ pub fn surrounding_gaps<N: Subnet>(
         } else {
             None
         }
+    })
+}
+
+/// Iterate over all prefixes with the given prefix length.
+pub fn iter_exact_prefixes<N: Subnet>(prefix: N, prefix_len: u8) -> impl Iterator<Item = N> {
+    let mut todo = std::collections::VecDeque::<N>::new();
+    todo.push_back(prefix);
+    std::iter::from_fn(move || {
+        while let Some(prefix) = todo.pop_front() {
+            if prefix.prefix() == prefix_len {
+                return Some(prefix);
+            }
+
+            let a = prefix.with_prefix_len(prefix.prefix() + 1);
+            let b = prefix
+                .toggle_bit(prefix.prefix())
+                .with_prefix_len(prefix.prefix() + 1);
+
+            todo.push_back(a);
+            todo.push_back(b);
+        }
+        None
     })
 }
 
@@ -515,5 +641,69 @@ mod tests {
 
         let gaps = surrounding_gaps(parent, child, None).collect::<Vec<_>>();
         assert_eq!(gaps, vec!["192.168.2.0/24".parse().unwrap(),]);
+    }
+
+    #[test]
+    fn test_iter_gaps() {
+        let mut table = UniversalIpTable::new();
+
+        let net1: IpNetwork = "192.168.2.0/24".parse().unwrap();
+        let net2: IpNetwork = "192.168.2.64/26".parse().unwrap();
+
+        table.insert(net1, 42);
+        table.insert(net2, 43);
+
+        let gaps = table.iter_gaps(net1, None).collect::<Vec<_>>();
+
+        assert_eq!(
+            gaps,
+            vec![
+                "192.168.2.128/25".parse().unwrap(),
+                "192.168.2.0/26".parse().unwrap(),
+            ]
+        );
+
+        let mut filled = table.clone();
+        filled.update(gaps.into_iter().map(|net| (net, 0)));
+        assert_eq!(filled.iter_gaps(net1, None).collect::<Vec<_>>(), vec![]);
+
+        let gaps = table.iter_gaps(net1, Some(25)).collect::<Vec<_>>();
+
+        assert_eq!(gaps, vec!["192.168.2.128/25".parse().unwrap(),]);
+
+        let mut filled = table.clone();
+        filled.update(gaps.into_iter().map(|net| (net, 0)));
+        assert_eq!(filled.iter_gaps(net1, Some(25)).collect::<Vec<_>>(), vec![]);
+
+        let gaps = table.iter_gaps(net1, Some(24)).collect::<Vec<_>>();
+        assert_eq!(gaps, vec![]);
+    }
+
+    #[test]
+    fn test_iter_exact_prefixes() {
+        let net: IpNetwork = "192.168.2.0/24".parse().unwrap();
+
+        let prefixes = iter_exact_prefixes(net, 24).collect::<Vec<_>>();
+        assert_eq!(prefixes, vec![net]);
+
+        let prefixes = iter_exact_prefixes(net, 25).collect::<Vec<_>>();
+        assert_eq!(
+            prefixes,
+            vec![
+                "192.168.2.0/25".parse().unwrap(),
+                "192.168.2.128/25".parse().unwrap()
+            ]
+        );
+
+        let prefixes = iter_exact_prefixes(net, 26).collect::<Vec<_>>();
+        assert_eq!(
+            prefixes,
+            vec![
+                "192.168.2.0/26".parse().unwrap(),
+                "192.168.2.64/26".parse().unwrap(),
+                "192.168.2.128/26".parse().unwrap(),
+                "192.168.2.192/26".parse().unwrap()
+            ]
+        );
     }
 }
