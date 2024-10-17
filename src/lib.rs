@@ -20,7 +20,7 @@
 //! assert_eq!(2, relevant.len());
 //!
 //! // Find unassigned /20s in the table
-//! let unassigned = table.iter_gaps(
+//! let unassigned = table.gaps(
 //!     "192.168.0.0/18".parse::<Ipv4Network>().unwrap(), Some(20))
 //!     .collect::<Vec<_>>();
 //!
@@ -109,7 +109,7 @@ impl Subnet for Ipv4Network {
     }
 
     fn network(self) -> Ipv4Addr {
-        self.network()
+        Ipv4Network::network(self)
     }
 }
 
@@ -152,7 +152,7 @@ impl Subnet for Ipv6Network {
     }
 
     fn network(self) -> Ipv6Addr {
-        self.network()
+        Ipv6Network::network(&self)
     }
 }
 
@@ -380,18 +380,18 @@ impl<N: Subnet, T> IpTable<N, T> {
     /// table.insert("192.168.2.0/24".parse::<IpNetwork>().unwrap(), 42);
     /// table.insert("192.168.2.128/25".parse::<IpNetwork>().unwrap(), 43);
     ///
-    /// let gaps = table.iter_gaps("192.168.0.0/18".parse::<IpNetwork>().unwrap(), Some(20))
+    /// let gaps = table.gaps("192.168.0.0/18".parse::<IpNetwork>().unwrap(), Some(20))
     ///    .collect::<Vec<_>>();
     /// assert_eq!(
     ///     gaps, vec![
     ///         "192.168.32.0/19".parse().unwrap(),
     ///         "192.168.16.0/20".parse().unwrap()]);
     /// ```
-    pub fn iter_gaps<S: Into<N>>(
+    pub fn gaps<S: Into<N>>(
         &self,
         prefix: S,
         max_prefix: Option<u8>,
-    ) -> impl Iterator<Item = N> + use<'_, S, N, T> {
+    ) -> impl Iterator<Item = N> + '_ {
         let prefix: N = prefix.into();
 
         let mut to_yield = vec![];
@@ -454,21 +454,14 @@ impl<N: Subnet, T> IpTable<N, T> {
     }
 
     /// Iterate over all gaps with a specific prefix length.
-    pub fn iter_gaps_with_prefix_len(
-        &self,
-        prefix: N,
-        prefix_len: u8,
-    ) -> impl Iterator<Item = N> + use<'_, N, T> {
-        self.iter_gaps(prefix, Some(prefix_len))
-            .flat_map(move |prefix| iter_exact_prefixes(prefix, prefix_len))
+    pub fn gaps_with_prefix_len(&self, prefix: N, prefix_len: u8) -> impl Iterator<Item = N> + '_ {
+        self.gaps(prefix, Some(prefix_len))
+            .flat_map(move |prefix| exact_prefixes(prefix, prefix_len))
     }
 
     /// Find all unassigned IPs in the given prefix.
-    pub fn iter_gap_ips_in_prefix(
-        &self,
-        prefix: N,
-    ) -> impl Iterator<Item = N::Address> + use<'_, N, T> {
-        self.iter_gaps_with_prefix_len(prefix, prefix.addr_size())
+    pub fn gap_ips_in_prefix(&self, prefix: N) -> impl Iterator<Item = N::Address> + '_ {
+        self.gaps_with_prefix_len(prefix, prefix.addr_size())
             .map(|net| net.network())
     }
 }
@@ -520,7 +513,7 @@ pub fn surrounding_gaps<N: Subnet>(
 }
 
 /// Iterate over all prefixes with the given prefix length.
-pub fn iter_exact_prefixes<N: Subnet>(prefix: N, prefix_len: u8) -> impl Iterator<Item = N> {
+pub fn exact_prefixes<N: Subnet>(prefix: N, prefix_len: u8) -> impl Iterator<Item = N> {
     let mut todo = std::collections::VecDeque::<N>::new();
     todo.push_back(prefix);
     std::iter::from_fn(move || {
@@ -708,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_gaps() {
+    fn test_gaps() {
         let mut table = UniversalIpTable::new();
 
         let net1: IpNetwork = "192.168.2.0/24".parse().unwrap();
@@ -717,7 +710,7 @@ mod tests {
         table.insert(net1, 42);
         table.insert(net2, 43);
 
-        let gaps = table.iter_gaps(net1, None).collect::<Vec<_>>();
+        let gaps = table.gaps(net1, None).collect::<Vec<_>>();
 
         assert_eq!(
             gaps,
@@ -729,28 +722,28 @@ mod tests {
 
         let mut filled = table.clone();
         filled.update(gaps.into_iter().map(|net| (net, 0)));
-        assert_eq!(filled.iter_gaps(net1, None).collect::<Vec<_>>(), vec![]);
+        assert_eq!(filled.gaps(net1, None).collect::<Vec<_>>(), vec![]);
 
-        let gaps = table.iter_gaps(net1, Some(25)).collect::<Vec<_>>();
+        let gaps = table.gaps(net1, Some(25)).collect::<Vec<_>>();
 
         assert_eq!(gaps, vec!["192.168.2.128/25".parse().unwrap(),]);
 
         let mut filled = table.clone();
         filled.update(gaps.into_iter().map(|net| (net, 0)));
-        assert_eq!(filled.iter_gaps(net1, Some(25)).collect::<Vec<_>>(), vec![]);
+        assert_eq!(filled.gaps(net1, Some(25)).collect::<Vec<_>>(), vec![]);
 
-        let gaps = table.iter_gaps(net1, Some(24)).collect::<Vec<_>>();
+        let gaps = table.gaps(net1, Some(24)).collect::<Vec<_>>();
         assert_eq!(gaps, vec![]);
     }
 
     #[test]
-    fn test_iter_exact_prefixes() {
+    fn test_exact_prefixes() {
         let net: IpNetwork = "192.168.2.0/24".parse().unwrap();
 
-        let prefixes = iter_exact_prefixes(net, 24).collect::<Vec<_>>();
+        let prefixes = exact_prefixes(net, 24).collect::<Vec<_>>();
         assert_eq!(prefixes, vec![net]);
 
-        let prefixes = iter_exact_prefixes(net, 25).collect::<Vec<_>>();
+        let prefixes = exact_prefixes(net, 25).collect::<Vec<_>>();
         assert_eq!(
             prefixes,
             vec![
@@ -759,7 +752,7 @@ mod tests {
             ]
         );
 
-        let prefixes = iter_exact_prefixes(net, 26).collect::<Vec<_>>();
+        let prefixes = exact_prefixes(net, 26).collect::<Vec<_>>();
         assert_eq!(
             prefixes,
             vec![
@@ -772,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_gaps_with_prefix_len() {
+    fn test_gaps_with_prefix_len() {
         let mut table = UniversalIpTable::new();
 
         let net1: IpNetwork = "192.168.2.128/25".parse().unwrap();
@@ -781,14 +774,14 @@ mod tests {
 
         let net: IpNetwork = "192.168.2.0/24".parse().unwrap();
         assert_eq!(
-            table.iter_gaps_with_prefix_len(net, 26).collect::<Vec<_>>(),
+            table.gaps_with_prefix_len(net, 26).collect::<Vec<_>>(),
             vec![
                 "192.168.2.0/26".parse().unwrap(),
                 "192.168.2.64/26".parse().unwrap()
             ]
         );
 
-        let mut gaps = table.iter_gaps_with_prefix_len(net, 32);
+        let mut gaps = table.gaps_with_prefix_len(net, 32);
         assert_eq!(
             "192.168.2.0/32".parse::<IpNetwork>().unwrap(),
             gaps.next().unwrap()
@@ -806,7 +799,7 @@ mod tests {
             gaps.next().unwrap()
         );
 
-        let mut gaps = table.iter_gap_ips_in_prefix(net);
+        let mut gaps = table.gap_ips_in_prefix(net);
         assert_eq!(
             "192.168.2.0".parse::<IpAddr>().unwrap(),
             gaps.next().unwrap()
