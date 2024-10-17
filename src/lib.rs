@@ -253,6 +253,7 @@ impl<N: Subnet, T: std::fmt::Debug> std::fmt::Debug for IpTable<N, T> {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::net::IpAddr;
