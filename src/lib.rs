@@ -46,6 +46,9 @@ pub trait Subnet: PartialOrd + Ord + PartialEq + Copy + std::fmt::Debug {
     ///
     /// The host bits are set to 0.
     fn with_prefix_len(self, prefix: u8) -> Self;
+
+    /// Toggle the bit at the given index.
+    fn toggle_bit(self, index: u8) -> Self;
 }
 
 impl Subnet for Ipv4Network {
@@ -73,6 +76,12 @@ impl Subnet for Ipv4Network {
         }
         Self::new(Ipv4Addr::from_bits(ip), prefix).unwrap()
     }
+
+    fn toggle_bit(self, index: u8) -> Self {
+        let mut ip = self.ip().to_bits();
+        ip ^= 1 << (31 - index);
+        Self::new(Ipv4Addr::from_bits(ip), self.prefix()).unwrap()
+    }
 }
 
 impl Subnet for Ipv6Network {
@@ -99,6 +108,12 @@ impl Subnet for Ipv6Network {
             ip &= !(1 << (127 - i));
         }
         Self::new(Ipv6Addr::from_bits(ip), prefix).unwrap()
+    }
+
+    fn toggle_bit(self, index: u8) -> Self {
+        let mut ip = self.ip().to_bits();
+        ip ^= 1 << (127 - index);
+        Self::new(Ipv6Addr::from_bits(ip), self.prefix()).unwrap()
     }
 }
 
@@ -130,6 +145,13 @@ impl Subnet for IpNetwork {
             IpNetwork::V6(net) => IpNetwork::V6(net.with_prefix_len(prefix)),
         }
     }
+
+    fn toggle_bit(self, index: u8) -> Self {
+        match self {
+            IpNetwork::V4(net) => IpNetwork::V4(net.toggle_bit(index)),
+            IpNetwork::V6(net) => IpNetwork::V6(net.toggle_bit(index)),
+        }
+    }
 }
 
 /// Base structure for storing values by CIDR.
@@ -144,7 +166,7 @@ pub type Ipv4Table<T> = IpTable<Ipv4Network, T>;
 /// A table for storing values by IPv6 CIDR.
 pub type Ipv6Table<T> = IpTable<Ipv6Network, T>;
 
-impl Default for UniversalIpTable<u32> {
+impl<T> Default for UniversalIpTable<T> {
     fn default() -> Self {
         UniversalIpTable::new()
     }
@@ -215,12 +237,21 @@ impl<N: Subnet, T> IpTable<N, T> {
         self.0.iter()
     }
 
-    /// Iterate over the prefixes under the given prefix.
+    /// Iterate over the prefixes under the given prefix, including the prefix itself.
     pub fn iter_prefix<S: Into<N>>(&self, prefix: S) -> impl Iterator<Item = (&N, &T)> {
         let prefix: N = prefix.into();
 
         self.0
             .range(prefix..prefix.last())
+            .filter(move |(net, _)| net.is_subnet_of(prefix))
+    }
+
+    /// Iterate over the prefixes under the given prefix, excluding the prefix itself.
+    pub fn iter_subprefixes<S: Into<N>>(&self, prefix: S) -> impl Iterator<Item = (&N, &T)> {
+        let prefix: N = prefix.into();
+
+        self.0
+            .range(prefix.with_prefix_len(prefix.prefix() + 1)..prefix.last())
             .filter(move |(net, _)| net.is_subnet_of(prefix))
     }
 
@@ -272,6 +303,52 @@ impl<N: Subnet, T> IpTable<N, T> {
             self.get(parent).map(|value| (parent, value))
         })
     }
+}
+
+/// Find all gaps in prefix before the given child prefix.
+///
+/// E.g.:
+/// If parent is 192.168.2.0/24, and child is 192.168.2.196/26
+///
+/// Then this will yield:
+/// 192.168.2.0/25
+/// 192.168.2.128/26
+///
+/// # Arguments
+/// * `prefix` - The parent prefix
+/// * `child` - The child prefix
+/// * `max_prefix` - The maximum prefix length to yield
+pub fn surrounding_gaps<N: Subnet>(
+    mut prefix: N,
+    child: N,
+    max_prefix: Option<u8>,
+) -> impl Iterator<Item = N> {
+    // Produce all subprefixes of the parent prefix
+    // 192.168.2.0/24 => overlaps
+    // 192.168.2.128/25 =>
+    // 192.168.2.128/26
+    let child = child.with_prefix_len(child.prefix());
+    let max_prefix = if let Some(max_prefix) = max_prefix {
+        std::cmp::min(max_prefix, child.prefix())
+    } else {
+        child.prefix()
+    };
+    (prefix.prefix() + 1..=max_prefix).flat_map(move |i| {
+        let a = prefix.with_prefix_len(i);
+        let b = prefix.toggle_bit(i - 1).with_prefix_len(i);
+
+        if child.is_subnet_of(a) {
+            prefix = a;
+            Some(b)
+        } else if child.is_subnet_of(b) {
+            prefix = b;
+            Some(a)
+        } else if prefix.prefix() + 1 == i {
+            Some(prefix)
+        } else {
+            None
+        }
+    })
 }
 
 impl<N: Subnet, T: std::fmt::Debug> std::fmt::Debug for IpTable<N, T> {
@@ -379,5 +456,64 @@ mod tests {
         table.insert(net1, 42);
         let ip1: IpAddr = "192.168.2.1".parse().unwrap();
         assert_eq!(table.get_containing_prefix(ip1).unwrap(), (net1, &42));
+    }
+
+    #[test]
+    fn test_surrounding_gaps() {
+        let parent: IpNetwork = "192.168.2.0/24".parse().unwrap();
+        let child: IpNetwork = "192.168.2.196/26".parse().unwrap();
+
+        let gaps = surrounding_gaps(parent, child, None).collect::<Vec<_>>();
+        assert_eq!(
+            gaps,
+            vec![
+                "192.168.2.0/25".parse().unwrap(),
+                "192.168.2.128/26".parse().unwrap()
+            ]
+        );
+
+        let parent: IpNetwork = "192.168.2.0/24".parse().unwrap();
+        let child: IpNetwork = "192.168.2.0/25".parse().unwrap();
+        let gaps = surrounding_gaps(parent, child, None).collect::<Vec<_>>();
+        assert_eq!(gaps, vec!["192.168.2.128/25".parse().unwrap(),]);
+
+        let parent: IpNetwork = "192.168.2.0/24".parse().unwrap();
+        let child: IpNetwork = "192.168.2.0/24".parse().unwrap();
+        let gaps = surrounding_gaps(parent, child, None).collect::<Vec<_>>();
+        assert_eq!(gaps, vec![]);
+
+        let parent: IpNetwork = "192.168.2.0/24".parse().unwrap();
+        let child: IpNetwork = "192.168.2.132".parse().unwrap();
+        let gaps = surrounding_gaps(parent, child, None).collect::<Vec<_>>();
+        assert_eq!(
+            gaps,
+            vec![
+                // 192.168.2.0-192.168.2.128
+                "192.168.2.0/25".parse().unwrap(),
+                "192.168.2.192/26".parse().unwrap(),
+                "192.168.2.160/27".parse().unwrap(),
+                "192.168.2.144/28".parse().unwrap(),
+                "192.168.2.136/29".parse().unwrap(),
+                "192.168.2.128/30".parse().unwrap(),
+                "192.168.2.134/31".parse().unwrap(),
+                "192.168.2.133/32".parse().unwrap(),
+            ]
+        );
+
+        let gaps = surrounding_gaps(parent, child, Some(26)).collect::<Vec<_>>();
+        assert_eq!(
+            gaps,
+            vec![
+                "192.168.2.0/25".parse().unwrap(),
+                "192.168.2.192/26".parse().unwrap(),
+            ]
+        );
+
+        // Child is unrelated
+        let parent: IpNetwork = "192.168.2.0/24".parse().unwrap();
+        let child: IpNetwork = "192.168.3.0/26".parse().unwrap();
+
+        let gaps = surrounding_gaps(parent, child, None).collect::<Vec<_>>();
+        assert_eq!(gaps, vec!["192.168.2.0/24".parse().unwrap(),]);
     }
 }
