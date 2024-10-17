@@ -259,7 +259,8 @@ impl<N: Subnet, T> IpTable<N, T> {
     }
 
     /// Insert a value into the table.
-    pub fn insert(&mut self, net: N, value: T) {
+    pub fn insert<S: Into<N>>(&mut self, net: S, value: T) {
+        let net: N = net.into();
         self.0.insert(net, value);
     }
 
@@ -287,7 +288,7 @@ impl<N: Subnet, T> IpTable<N, T> {
         self.0.entry(net)
     }
 
-    /// Iterate over the entries in the table.
+    /// Iterate over the entries in the table, ordered by prefix.
     pub fn iter(&self) -> impl Iterator<Item = (&N, &T)> {
         self.0.iter()
     }
@@ -561,7 +562,7 @@ mod tests {
 
     #[test]
     fn test_simple() {
-        let mut table = IpTable::new();
+        let mut table = IpTable::<IpNetwork, u32>::new();
 
         let net: IpNetwork = "192.168.0.0/24".parse().unwrap();
 
@@ -587,8 +588,8 @@ mod tests {
         let net2: IpNetwork = "192.168.5.0/24".parse().unwrap();
         let net3: IpNetwork = "10.1.2.3/32".parse().unwrap();
 
-        table.insert(ip1.into(), 1);
-        table.insert(ip2.into(), 2);
+        table.insert(ip1, 1);
+        table.insert(ip2, 2);
         table.insert(net1, 42);
         table.insert(net2, 43);
         table.insert(net3, 44);
