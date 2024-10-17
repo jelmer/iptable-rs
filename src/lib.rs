@@ -407,6 +407,16 @@ impl<N: Subnet, T> IpTable<N, T> {
             None
         })
     }
+
+    /// Iterate over all gaps with a specific prefix length.
+    pub fn iter_gaps_with_prefix_len(
+        &self,
+        prefix: N,
+        prefix_len: u8,
+    ) -> impl Iterator<Item = N> + use<'_, N, T> {
+        self.iter_gaps(prefix, Some(prefix_len))
+            .flat_map(move |prefix| iter_exact_prefixes(prefix, prefix_len))
+    }
 }
 
 /// Find all gaps in prefix before the given child prefix.
@@ -704,6 +714,42 @@ mod tests {
                 "192.168.2.128/26".parse().unwrap(),
                 "192.168.2.192/26".parse().unwrap()
             ]
+        );
+    }
+
+    #[test]
+    fn test_iter_gaps_with_prefix_len() {
+        let mut table = UniversalIpTable::new();
+
+        let net1: IpNetwork = "192.168.2.128/25".parse().unwrap();
+
+        table.insert(net1, 42);
+
+        let net: IpNetwork = "192.168.2.0/24".parse().unwrap();
+        assert_eq!(
+            table.iter_gaps_with_prefix_len(net, 26).collect::<Vec<_>>(),
+            vec![
+                "192.168.2.0/26".parse().unwrap(),
+                "192.168.2.64/26".parse().unwrap()
+            ]
+        );
+
+        let mut gaps = table.iter_gaps_with_prefix_len(net, 32);
+        assert_eq!(
+            "192.168.2.0/32".parse::<IpNetwork>().unwrap(),
+            gaps.next().unwrap()
+        );
+        assert_eq!(
+            "192.168.2.1/32".parse::<IpNetwork>().unwrap(),
+            gaps.next().unwrap()
+        );
+        assert_eq!(
+            "192.168.2.2/32".parse::<IpNetwork>().unwrap(),
+            gaps.next().unwrap()
+        );
+        assert_eq!(
+            "192.168.2.3/32".parse::<IpNetwork>().unwrap(),
+            gaps.next().unwrap()
         );
     }
 }
