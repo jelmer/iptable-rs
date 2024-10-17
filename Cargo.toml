@@ -5,6 +5,8 @@ edition = "2021"
 description = "Datastructure for efficient IP address lookup"
 license = "Apache-2.0"
 author = "Jelmer Vernooĳ <jelmer@jelmer.uk>"
+repository = "https://github.com/jelmer/iptable-rs"
+homepage = "https://github.com/jelmer/iptable-rs"
 
 [dependencies]
 ipnetwork = "0.20.0"
