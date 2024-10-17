@@ -159,6 +159,12 @@ impl<N: Subnet, T> IntoIterator for IpTable<N, T> {
     }
 }
 
+impl<N: Subnet, T> FromIterator<(N, T)> for IpTable<N, T> {
+    fn from_iter<I: IntoIterator<Item = (N, T)>>(iter: I) -> Self {
+        IpTable(iter.into_iter().collect())
+    }
+}
+
 impl<N: Subnet, T> IpTable<N, T> {
     /// Create a new table.
     pub fn new() -> Self {
