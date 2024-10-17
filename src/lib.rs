@@ -187,8 +187,17 @@ impl<N: Subnet, T> IpTable<N, T> {
     }
 
     /// Get a value from the table.
+    ///
+    /// Exact match only.
     pub fn get<S: Into<N>>(&self, net: S) -> Option<&T> {
         self.0.get(&net.into())
+    }
+
+    /// Get a mutable reference to a value in the table.
+    ///
+    /// Exact match only.
+    pub fn get_mut<S: Into<N>>(&mut self, net: S) -> Option<&mut T> {
+        self.0.get_mut(&net.into())
     }
 
     /// Remove a value from the table.
@@ -237,13 +246,25 @@ impl<N: Subnet, T> IpTable<N, T> {
         new_table
     }
 
-    /// Get the value for the closest ancestor of the given network.
+    /// Get the value for the longest prefix that contains the given network.
+    ///
+    /// # Example
+    /// ```
+    /// use iptable::UniversalIpTable;
+    /// use ipnetwork::IpNetwork;
+    /// let mut table = UniversalIpTable::new();
+    /// table.insert("192.168.2.0/24".parse::<IpNetwork>().unwrap(), 42);
+    /// let ip1: std::net::IpAddr = "192.168.2.4".parse().unwrap();
+    /// assert_eq!(
+    ///     table.get_containing_prefix(ip1),
+    ///     Some(("192.168.2.0/24".parse().unwrap(), &42)));
+    /// ```
     pub fn get_containing_prefix<S: Into<N>>(&self, net: S) -> Option<(N, &T)> {
         let net: N = net.into();
         self.iter_containing_prefixes(net).next()
     }
 
-    /// Iterate over the shorter prefixes of the given network.
+    /// Iterate over the shorter prefixes of the given network, longest first.
     pub fn iter_containing_prefixes<S: Into<N>>(&self, net: S) -> impl Iterator<Item = (N, &T)> {
         let net: N = net.into();
         (0..net.prefix()).rev().filter_map(move |i| {
