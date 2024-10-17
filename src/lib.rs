@@ -280,6 +280,20 @@ impl<N: Subnet, T: std::fmt::Debug> std::fmt::Debug for IpTable<N, T> {
     }
 }
 
+impl<N: Subnet, T: Clone> Clone for IpTable<N, T> {
+    fn clone(&self) -> Self {
+        IpTable(self.0.clone())
+    }
+}
+
+impl<N: Subnet, T: PartialEq> PartialEq for IpTable<N, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<N: Subnet, T: Eq> Eq for IpTable<N, T> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
