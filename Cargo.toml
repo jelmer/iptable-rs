@@ -1,0 +1,10 @@
+[package]
+name = "iptable"
+version = "0.1.0"
+edition = "2021"
+description = "Datastructure for efficient IP address lookup"
+license = "Apache-2.0"
+author = "Jelmer Vernooĳ <jelmer@jelmer.uk>"
+
+[dependencies]
+ipnetwork = "0.20.0"
