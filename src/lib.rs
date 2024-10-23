@@ -42,7 +42,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// A trait for types that can be used as subnets.
-pub trait Subnet: PartialOrd + Ord + PartialEq + Copy + std::fmt::Debug {
+pub trait Subnet: PartialOrd + Ord + PartialEq + Copy + std::fmt::Debug + std::hash::Hash {
     /// The address type for the subnet.
     type Address: Copy + std::fmt::Debug;
 
@@ -465,6 +465,45 @@ impl<N: Subnet, T> IpTable<N, T> {
         self.gaps_with_prefix_len(prefix, prefix.addr_size())
             .map(|net| net.network())
     }
+
+    /// Iterate over the non-overlapping occupied prefixes in the table.
+    ///
+    /// This will merge adjacent prefixes as much as possible.
+    pub fn iter_occupied(&self) -> impl Iterator<Item = N> + '_ {
+        // iterate over all the prefix lengths, longest to shortest
+        // for each prefix length, iterate over all the prefixes with that length
+
+        let mut by_len: std::collections::HashMap<u8, std::collections::HashSet<N>> =
+            std::collections::HashMap::new();
+        for (net, _) in self.iter() {
+            by_len.entry(net.prefix()).or_default().insert(*net);
+        }
+
+        let by_len = std::rc::Rc::new(std::cell::RefCell::new(by_len));
+
+        (0..=128).rev().flat_map(move |l| {
+            let by_len = by_len.clone();
+            let prefixes = by_len.borrow_mut().remove(&l).unwrap_or_default();
+
+            prefixes.clone().into_iter().filter(move |prefix| {
+                let by_len = by_len.clone();
+                // find the toggled prefix
+                let toggled = prefix.toggle_bit(prefix.prefix() - 1);
+                // if the toggled prefix is in the table, then add the parent prefix to the
+                // list
+                if !prefixes.contains(&toggled) {
+                    true
+                } else {
+                    by_len
+                        .borrow_mut()
+                        .entry(prefix.prefix() - 1)
+                        .or_default()
+                        .insert(prefix.with_prefix_len(prefix.prefix() - 1));
+                    false
+                }
+            })
+        })
+    }
 }
 
 /// Find all gaps in prefix before the given child prefix.
@@ -808,6 +847,49 @@ mod tests {
         assert_eq!(
             "192.168.2.1".parse::<IpAddr>().unwrap(),
             gaps.next().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_iter_occupied() {
+        let mut table = UniversalIpTable::new();
+
+        let net1: IpNetwork = "192.168.0.0/24".parse().unwrap();
+        let net2: IpNetwork = "192.168.1.0/24".parse().unwrap();
+
+        table.insert(net1, 42);
+        table.insert(net2, 43);
+
+        let occupied = table.iter_occupied().collect::<Vec<_>>();
+        assert_eq!(occupied, vec!["192.168.0.0/23".parse().unwrap(),]);
+
+        let net3: IpNetwork = "192.168.3.0/24".parse().unwrap();
+        table.insert(net3, 44);
+
+        let occupied = table.iter_occupied().collect::<Vec<_>>();
+        assert_eq!(
+            occupied,
+            vec![
+                "192.168.3.0/24".parse().unwrap(),
+                "192.168.0.0/23".parse().unwrap(),
+            ]
+        );
+
+        let net4: IpNetwork = "192.168.2.0/24".parse().unwrap();
+        table.insert(net4, 45);
+
+        let occupied = table.iter_occupied().collect::<Vec<_>>();
+        assert_eq!(occupied, vec!["192.168.0.0/22".parse().unwrap(),]);
+
+        let net5: IpNetwork = "192.168.4.0/24".parse().unwrap();
+        table.insert(net5, 46);
+        let occupied = table.iter_occupied().collect::<Vec<_>>();
+        assert_eq!(
+            occupied,
+            vec![
+                "192.168.4.0/24".parse().unwrap(),
+                "192.168.0.0/22".parse().unwrap(),
+            ]
         );
     }
 }
