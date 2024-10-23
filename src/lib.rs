@@ -284,8 +284,8 @@ impl<N: Subnet, T> IpTable<N, T> {
     }
 
     /// Get the entry for the given network.
-    pub fn entry(&mut self, net: N) -> std::collections::btree_map::Entry<N, T> {
-        self.0.entry(net)
+    pub fn entry<S: Into<N>>(&mut self, net: S) -> std::collections::btree_map::Entry<N, T> {
+        self.0.entry(net.into())
     }
 
     /// Iterate over the entries in the table, ordered by prefix.
@@ -514,6 +514,11 @@ impl<N: Subnet, T> IpTable<N, T> {
     /// This will yield the prefixes in order of length, longest first.
     pub fn iter_occupied_prefix(&self, prefix: N) -> impl Iterator<Item = N> + '_ {
         self._iter_occupied(self.iter_prefix(prefix).map(|(net, _)| *net))
+    }
+
+    /// Iterate over all the values in this iptable
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.0.values()
     }
 }
 
