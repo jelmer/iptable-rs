@@ -466,17 +466,14 @@ impl<N: Subnet, T> IpTable<N, T> {
             .map(|net| net.network())
     }
 
-    /// Iterate over the non-overlapping occupied prefixes in the table.
-    ///
-    /// This will merge adjacent prefixes as much as possible.
-    pub fn iter_occupied(&self) -> impl Iterator<Item = N> + '_ {
+    fn _iter_occupied(&self, prefixes: impl Iterator<Item = N>) -> impl Iterator<Item = N> + '_ {
         // iterate over all the prefix lengths, longest to shortest
         // for each prefix length, iterate over all the prefixes with that length
 
         let mut by_len: std::collections::HashMap<u8, std::collections::HashSet<N>> =
             std::collections::HashMap::new();
-        for (net, _) in self.iter() {
-            by_len.entry(net.prefix()).or_default().insert(*net);
+        for net in prefixes {
+            by_len.entry(net.prefix()).or_default().insert(net);
         }
 
         let by_len = std::rc::Rc::new(std::cell::RefCell::new(by_len));
@@ -503,6 +500,20 @@ impl<N: Subnet, T> IpTable<N, T> {
                 }
             })
         })
+    }
+
+    /// Iterate over the non-overlapping occupied prefixes in the table.
+    ///
+    /// This will merge adjacent prefixes as much as possible.
+    pub fn iter_occupied(&self) -> impl Iterator<Item = N> + '_ {
+        self._iter_occupied(self.0.keys().copied())
+    }
+
+    /// Iterate over the occupied prefixes in the table under a given prefix.
+    ///
+    /// This will yield the prefixes in order of length, longest first.
+    pub fn iter_occupied_prefix(&self, prefix: N) -> impl Iterator<Item = N> + '_ {
+        self._iter_occupied(self.iter_prefix(prefix).map(|(net, _)| *net))
     }
 }
 
@@ -891,5 +902,22 @@ mod tests {
                 "192.168.0.0/22".parse().unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn test_iter_occupied_prefix() {
+        let mut table = UniversalIpTable::new();
+
+        let net1: IpNetwork = "192.168.0.0/24".parse().unwrap();
+        let net2: IpNetwork = "192.168.1.0/24".parse().unwrap();
+
+        table.insert(net1, 42);
+        table.insert(net2, 43);
+
+        let net: IpNetwork = "192.168.0.0/16".parse().unwrap();
+
+        let occupied = table.iter_occupied_prefix(net).collect::<Vec<_>>();
+
+        assert_eq!(occupied, vec!["192.168.0.0/23".parse().unwrap(),]);
     }
 }
