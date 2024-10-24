@@ -26,8 +26,8 @@
 //!
 //! assert_eq!(
 //!    unassigned, vec![
-//!        "192.168.32.0/19".parse().unwrap(),
-//!        "192.168.16.0/20".parse().unwrap()]);
+//!        "192.168.16.0/20".parse().unwrap(),
+//!        "192.168.32.0/19".parse().unwrap()]);
 //!
 //! // Merge entries with longer prefixes
 //! let merged_table = table.merge_longer_prefixes(16, |a, b| a + b);
@@ -388,8 +388,8 @@ impl<N: Subnet, T> IpTable<N, T> {
     ///    .collect::<Vec<_>>();
     /// assert_eq!(
     ///     gaps, vec![
-    ///         "192.168.32.0/19".parse().unwrap(),
-    ///         "192.168.16.0/20".parse().unwrap()]);
+    ///         "192.168.16.0/20".parse().unwrap(),
+    ///         "192.168.32.0/19".parse().unwrap()]);
     /// ```
     pub fn gaps<S: Into<N>>(
         &self,
@@ -398,16 +398,11 @@ impl<N: Subnet, T> IpTable<N, T> {
     ) -> impl Iterator<Item = N> + '_ {
         let prefix: N = prefix.into();
 
-        let mut to_yield = vec![];
         let mut todo = std::iter::once(prefix).collect::<std::collections::BTreeSet<_>>();
         // for each side, check if it is in the table
         // if it has some children in the table, add it to the todo list
         // if it has no children in the table, yield it
         std::iter::from_fn(move || {
-            if let Some(y) = to_yield.pop() {
-                return Some(y);
-            }
-
             while let Some(prefix) = todo.pop_first() {
                 // If the prefix nor any children are in the table, yield it
                 if self.iter_prefix(prefix).next().is_none() {
@@ -423,34 +418,12 @@ impl<N: Subnet, T> IpTable<N, T> {
                     .toggle_bit(prefix.prefix())
                     .with_prefix_len(prefix.prefix() + 1);
 
-                match self.iter_prefix(b).next() {
-                    // If b is in the table, we don't need to check it further
-                    Some((n, _)) if *n == b => {}
-                    // b is not in the children, but it has children. need to check further
-                    Some(_) => {
-                        todo.insert(b);
-                    }
-                    // b is not in the table, and has no children. yield it
-                    Option::None => {
-                        to_yield.push(b);
-                    }
+                if !self.contains(b) {
+                    todo.insert(b);
                 }
 
-                match self.iter_prefix(a).next() {
-                    // If a is in the table, we don't need to check it further
-                    Some((n, _)) if *n == a => {}
-                    // a is not in the children, but it has children. need to check further
-                    Some(_) => {
-                        todo.insert(a);
-                    }
-                    // a is not in the table, and has no children. yield it
-                    Option::None => {
-                        to_yield.push(a);
-                    }
-                }
-
-                if let Some(y) = to_yield.pop() {
-                    return Some(y);
+                if !self.contains(a) {
+                    todo.insert(a);
                 }
             }
             None
@@ -509,7 +482,6 @@ impl<N: Subnet, T> IpTable<N, T> {
             }
             None
         })
-
     }
 
     /// Find all unassigned IPs in the given prefix.
@@ -822,8 +794,8 @@ mod tests {
         assert_eq!(
             gaps,
             vec![
-                "192.168.2.128/25".parse().unwrap(),
                 "192.168.2.0/26".parse().unwrap(),
+                "192.168.2.128/25".parse().unwrap(),
             ]
         );
 
