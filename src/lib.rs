@@ -26,8 +26,8 @@
 //!
 //! assert_eq!(
 //!    unassigned, vec![
-//!        "192.168.32.0/19".parse().unwrap(),
-//!        "192.168.16.0/20".parse().unwrap()]);
+//!        "192.168.16.0/20".parse().unwrap(),
+//!        "192.168.32.0/19".parse().unwrap()]);
 //!
 //! // Merge entries with longer prefixes
 //! let merged_table = table.merge_longer_prefixes(16, |a, b| a + b);
@@ -210,24 +210,27 @@ impl Subnet for IpNetwork {
 }
 
 /// Base structure for storing values by CIDR.
-pub struct IpTable<N: Subnet, T>(BTreeMap<N, T>);
+pub struct GenericIpTable<N: Subnet, T>(BTreeMap<N, T>);
 
 /// A table for storing values by IPv4 or IPv6 CIDR.
-pub type UniversalIpTable<T> = IpTable<IpNetwork, T>;
+pub type IpTable<T> = GenericIpTable<IpNetwork, T>;
+
+/// Alias for IpTable
+pub type UniversalIpTable<T> = IpTable<T>;
 
 /// A table for storing values by IPv4 CIDR.
-pub type Ipv4Table<T> = IpTable<Ipv4Network, T>;
+pub type Ipv4Table<T> = GenericIpTable<Ipv4Network, T>;
 
 /// A table for storing values by IPv6 CIDR.
-pub type Ipv6Table<T> = IpTable<Ipv6Network, T>;
+pub type Ipv6Table<T> = GenericIpTable<Ipv6Network, T>;
 
-impl<T> Default for UniversalIpTable<T> {
+impl<T> Default for IpTable<T> {
     fn default() -> Self {
-        UniversalIpTable::new()
+        IpTable::new()
     }
 }
 
-impl<N: Subnet, T> IntoIterator for IpTable<N, T> {
+impl<N: Subnet, T> IntoIterator for GenericIpTable<N, T> {
     type Item = (N, T);
     type IntoIter = std::collections::btree_map::IntoIter<N, T>;
 
@@ -236,16 +239,16 @@ impl<N: Subnet, T> IntoIterator for IpTable<N, T> {
     }
 }
 
-impl<N: Subnet, T> FromIterator<(N, T)> for IpTable<N, T> {
+impl<N: Subnet, T> FromIterator<(N, T)> for GenericIpTable<N, T> {
     fn from_iter<I: IntoIterator<Item = (N, T)>>(iter: I) -> Self {
-        IpTable(iter.into_iter().collect())
+        Self(iter.into_iter().collect())
     }
 }
 
-impl<N: Subnet, T> IpTable<N, T> {
+impl<N: Subnet, T> GenericIpTable<N, T> {
     /// Create a new table.
     pub fn new() -> Self {
-        IpTable(BTreeMap::new())
+        Self(BTreeMap::new())
     }
 
     /// Returns the number of elements in the table.
@@ -337,9 +340,9 @@ impl<N: Subnet, T> IpTable<N, T> {
     ///
     /// # Example
     /// ```
-    /// use iptable::UniversalIpTable;
+    /// use iptable::IpTable;
     /// use ipnetwork::IpNetwork;
-    /// let mut table = UniversalIpTable::new();
+    /// let mut table = IpTable::new();
     /// table.insert("192.168.2.0/24".parse::<IpNetwork>().unwrap(), 42);
     /// let ip1: std::net::IpAddr = "192.168.2.4".parse().unwrap();
     /// assert_eq!(
@@ -369,15 +372,18 @@ impl<N: Subnet, T> IpTable<N, T> {
 
     /// Iterate over the gaps in the table.
     ///
+    /// This will yield the prefixes that are not in the table. The shortest prefixes
+    /// will be yielded first.
+    ///
     /// # Arguments
     /// * `prefix` - The prefix under which to find gaps
     /// * `max_prefix` - The maximum prefix length to yield
     ///
     /// # Example
     /// ```
-    /// use iptable::UniversalIpTable;
+    /// use iptable::IpTable;
     /// use ipnetwork::IpNetwork;
-    /// let mut table = UniversalIpTable::new();
+    /// let mut table = IpTable::new();
     /// table.insert("192.168.2.0/24".parse::<IpNetwork>().unwrap(), 42);
     /// table.insert("192.168.2.128/25".parse::<IpNetwork>().unwrap(), 43);
     ///
@@ -385,8 +391,8 @@ impl<N: Subnet, T> IpTable<N, T> {
     ///    .collect::<Vec<_>>();
     /// assert_eq!(
     ///     gaps, vec![
-    ///         "192.168.32.0/19".parse().unwrap(),
-    ///         "192.168.16.0/20".parse().unwrap()]);
+    ///         "192.168.16.0/20".parse().unwrap(),
+    ///         "192.168.32.0/19".parse().unwrap()]);
     /// ```
     pub fn gaps<S: Into<N>>(
         &self,
@@ -395,17 +401,12 @@ impl<N: Subnet, T> IpTable<N, T> {
     ) -> impl Iterator<Item = N> + '_ {
         let prefix: N = prefix.into();
 
-        let mut to_yield = vec![];
-        let mut todo = vec![prefix];
+        let mut todo = std::iter::once(prefix).collect::<std::collections::BTreeSet<_>>();
         // for each side, check if it is in the table
         // if it has some children in the table, add it to the todo list
         // if it has no children in the table, yield it
         std::iter::from_fn(move || {
-            if let Some(y) = to_yield.pop() {
-                return Some(y);
-            }
-
-            while let Some(prefix) = todo.pop() {
+            while let Some(prefix) = todo.pop_first() {
                 // If the prefix nor any children are in the table, yield it
                 if self.iter_prefix(prefix).next().is_none() {
                     return Some(prefix);
@@ -420,44 +421,70 @@ impl<N: Subnet, T> IpTable<N, T> {
                     .toggle_bit(prefix.prefix())
                     .with_prefix_len(prefix.prefix() + 1);
 
-                match self.iter_prefix(a).next() {
-                    // If a is in the table, we don't need to check it further
-                    Some((n, _)) if *n == a => {}
-                    // a is not in the children, but it has children. need to check further
-                    Some(_) => {
-                        todo.push(a);
-                    }
-                    // a is not in the table, and has no children. yield it
-                    Option::None => {
-                        to_yield.push(a);
-                    }
+                if !self.contains(b) {
+                    todo.insert(b);
                 }
 
-                match self.iter_prefix(b).next() {
-                    // If b is in the table, we don't need to check it further
-                    Some((n, _)) if *n == b => {}
-                    // b is not in the children, but it has children. need to check further
-                    Some(_) => {
-                        todo.push(b);
-                    }
-                    // b is not in the table, and has no children. yield it
-                    Option::None => {
-                        to_yield.push(b);
-                    }
-                }
-
-                if let Some(y) = to_yield.pop() {
-                    return Some(y);
+                if !self.contains(a) {
+                    todo.insert(a);
                 }
             }
             None
         })
     }
 
+    /// Check if the table contains the given network.
+    pub fn contains<S: Into<N>>(&self, net: S) -> bool {
+        let net: N = net.into();
+        self.0.contains_key(&net)
+    }
+
+    /// Return values for all the prefixes in the table.
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.0.values()
+    }
+
+    /// Retain only the entries that satisfy the predicate.
+    pub fn retain<F: FnMut(&N, &T) -> bool>(&mut self, mut f: F) {
+        self.0.retain(|k, v| f(k, v));
+    }
+
     /// Iterate over all gaps with a specific prefix length.
     pub fn gaps_with_prefix_len(&self, prefix: N, prefix_len: u8) -> impl Iterator<Item = N> + '_ {
-        self.gaps(prefix, Some(prefix_len))
-            .flat_map(move |prefix| exact_prefixes(prefix, prefix_len))
+        let prefix: N = prefix.into();
+
+        let mut todo = std::iter::once(prefix).collect::<std::collections::BTreeSet<_>>();
+        // for each side, check if it is in the table
+        // if it has some children in the table, add it to the todo list
+        // if it has no children in the table, yield it
+        std::iter::from_fn(move || {
+            while let Some(prefix) = todo.pop_first() {
+                // If the prefix is the right length, then we can either yield it
+                // or skip it if it exists or has children
+                if prefix.prefix() == prefix_len {
+                    if self.iter_prefix(prefix).next().is_none() {
+                        return Some(prefix);
+                    }
+                    continue;
+                }
+
+                assert!(prefix.prefix() < prefix_len);
+
+                let a = prefix.with_prefix_len(prefix.prefix() + 1);
+                let b = prefix
+                    .toggle_bit(prefix.prefix())
+                    .with_prefix_len(prefix.prefix() + 1);
+
+                if !self.contains(b) {
+                    todo.insert(b);
+                }
+
+                if !self.contains(a) {
+                    todo.insert(a);
+                }
+            }
+            None
+        })
     }
 
     /// Find all unassigned IPs in the given prefix.
@@ -523,8 +550,10 @@ impl<N: Subnet, T> IpTable<N, T> {
 /// If parent is 192.168.2.0/24, and child is 192.168.2.196/26
 ///
 /// Then this will yield:
-/// 192.168.2.0/25
 /// 192.168.2.128/26
+/// 192.168.2.0/25
+///
+/// This will yield the shortest prefixes first.
 ///
 /// # Arguments
 /// * `prefix` - The parent prefix
@@ -569,7 +598,6 @@ pub fn exact_prefixes<N: Subnet>(prefix: N, prefix_len: u8) -> impl Iterator<Ite
     todo.push_back(prefix);
     std::iter::from_fn(move || {
         while let Some(prefix) = todo.pop_front() {
-            assert!(todo.len() < 100, "todo: {:?}", todo);
             if prefix.prefix() == prefix_len {
                 return Some(prefix);
             }
@@ -588,25 +616,25 @@ pub fn exact_prefixes<N: Subnet>(prefix: N, prefix_len: u8) -> impl Iterator<Ite
     })
 }
 
-impl<N: Subnet, T: std::fmt::Debug> std::fmt::Debug for IpTable<N, T> {
+impl<N: Subnet, T: std::fmt::Debug> std::fmt::Debug for GenericIpTable<N, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map().entries(self.0.iter()).finish()
     }
 }
 
-impl<N: Subnet, T: Clone> Clone for IpTable<N, T> {
+impl<N: Subnet, T: Clone> Clone for GenericIpTable<N, T> {
     fn clone(&self) -> Self {
-        IpTable(self.0.clone())
+        Self(self.0.clone())
     }
 }
 
-impl<N: Subnet, T: PartialEq> PartialEq for IpTable<N, T> {
+impl<N: Subnet, T: PartialEq> PartialEq for GenericIpTable<N, T> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
 
-impl<N: Subnet, T: Eq> Eq for IpTable<N, T> {}
+impl<N: Subnet, T: Eq> Eq for GenericIpTable<N, T> {}
 
 #[cfg(test)]
 mod tests {
@@ -615,7 +643,7 @@ mod tests {
 
     #[test]
     fn test_simple() {
-        let mut table = IpTable::<IpNetwork, u32>::new();
+        let mut table = GenericIpTable::<IpNetwork, u32>::new();
 
         let net: IpNetwork = "192.168.0.0/24".parse().unwrap();
 
@@ -630,7 +658,7 @@ mod tests {
 
     #[test]
     fn test_iter_prefix() {
-        let mut table = UniversalIpTable::new();
+        let mut table = IpTable::new();
 
         assert!(table.is_empty());
         assert_eq!(table.len(), 0);
@@ -668,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_merge_longer_prefixes() {
-        let mut table = UniversalIpTable::new();
+        let mut table = IpTable::new();
 
         let net1: IpNetwork = "192.168.2.0/24".parse().unwrap();
         let net2: IpNetwork = "192.168.2.64/26".parse().unwrap();
@@ -686,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_get_ancestor() {
-        let mut table = UniversalIpTable::new();
+        let mut table = IpTable::new();
 
         let net1: IpNetwork = "192.168.0.0/16".parse().unwrap();
 
@@ -756,7 +784,7 @@ mod tests {
 
     #[test]
     fn test_gaps() {
-        let mut table = UniversalIpTable::new();
+        let mut table = IpTable::new();
 
         let net1: IpNetwork = "192.168.2.0/24".parse().unwrap();
         let net2: IpNetwork = "192.168.2.64/26".parse().unwrap();
@@ -769,8 +797,8 @@ mod tests {
         assert_eq!(
             gaps,
             vec![
-                "192.168.2.128/25".parse().unwrap(),
                 "192.168.2.0/26".parse().unwrap(),
+                "192.168.2.128/25".parse().unwrap(),
             ]
         );
 
@@ -854,7 +882,7 @@ mod tests {
 
     #[test]
     fn test_gaps_with_prefix_len() {
-        let mut table = UniversalIpTable::new();
+        let mut table = IpTable::new();
 
         let net1: IpNetwork = "192.168.2.128/25".parse().unwrap();
 
@@ -908,7 +936,7 @@ mod tests {
 
     #[test]
     fn test_iter_occupied() {
-        let mut table = UniversalIpTable::new();
+        let mut table = IpTable::new();
 
         let net1: IpNetwork = "192.168.0.0/24".parse().unwrap();
         let net2: IpNetwork = "192.168.1.0/24".parse().unwrap();
@@ -951,7 +979,7 @@ mod tests {
 
     #[test]
     fn test_iter_occupied_prefix() {
-        let mut table = UniversalIpTable::new();
+        let mut table = IpTable::new();
 
         let net1: IpNetwork = "192.168.0.0/24".parse().unwrap();
         let net2: IpNetwork = "192.168.1.0/24".parse().unwrap();
