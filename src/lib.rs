@@ -369,6 +369,9 @@ impl<N: Subnet, T> IpTable<N, T> {
 
     /// Iterate over the gaps in the table.
     ///
+    /// This will yield the prefixes that are not in the table. The shortest prefixes
+    /// will be yielded first.
+    ///
     /// # Arguments
     /// * `prefix` - The prefix under which to find gaps
     /// * `max_prefix` - The maximum prefix length to yield
@@ -569,7 +572,6 @@ pub fn exact_prefixes<N: Subnet>(prefix: N, prefix_len: u8) -> impl Iterator<Ite
     todo.push_back(prefix);
     std::iter::from_fn(move || {
         while let Some(prefix) = todo.pop_front() {
-            assert!(todo.len() < 100, "todo: {:?}", todo);
             if prefix.prefix() == prefix_len {
                 return Some(prefix);
             }
