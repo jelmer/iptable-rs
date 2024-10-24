@@ -399,7 +399,7 @@ impl<N: Subnet, T> IpTable<N, T> {
         let prefix: N = prefix.into();
 
         let mut to_yield = vec![];
-        let mut todo = vec![prefix];
+        let mut todo = std::iter::once(prefix).collect::<std::collections::BTreeSet<_>>();
         // for each side, check if it is in the table
         // if it has some children in the table, add it to the todo list
         // if it has no children in the table, yield it
@@ -408,7 +408,7 @@ impl<N: Subnet, T> IpTable<N, T> {
                 return Some(y);
             }
 
-            while let Some(prefix) = todo.pop() {
+            while let Some(prefix) = todo.pop_first() {
                 // If the prefix nor any children are in the table, yield it
                 if self.iter_prefix(prefix).next().is_none() {
                     return Some(prefix);
@@ -423,29 +423,29 @@ impl<N: Subnet, T> IpTable<N, T> {
                     .toggle_bit(prefix.prefix())
                     .with_prefix_len(prefix.prefix() + 1);
 
-                match self.iter_prefix(a).next() {
-                    // If a is in the table, we don't need to check it further
-                    Some((n, _)) if *n == a => {}
-                    // a is not in the children, but it has children. need to check further
-                    Some(_) => {
-                        todo.push(a);
-                    }
-                    // a is not in the table, and has no children. yield it
-                    Option::None => {
-                        to_yield.push(a);
-                    }
-                }
-
                 match self.iter_prefix(b).next() {
                     // If b is in the table, we don't need to check it further
                     Some((n, _)) if *n == b => {}
                     // b is not in the children, but it has children. need to check further
                     Some(_) => {
-                        todo.push(b);
+                        todo.insert(b);
                     }
                     // b is not in the table, and has no children. yield it
                     Option::None => {
                         to_yield.push(b);
+                    }
+                }
+
+                match self.iter_prefix(a).next() {
+                    // If a is in the table, we don't need to check it further
+                    Some((n, _)) if *n == a => {}
+                    // a is not in the children, but it has children. need to check further
+                    Some(_) => {
+                        todo.insert(a);
+                    }
+                    // a is not in the table, and has no children. yield it
+                    Option::None => {
+                        to_yield.push(a);
                     }
                 }
 
@@ -457,10 +457,59 @@ impl<N: Subnet, T> IpTable<N, T> {
         })
     }
 
+    /// Check if the table contains the given network.
+    pub fn contains<S: Into<N>>(&self, net: S) -> bool {
+        let net: N = net.into();
+        self.0.contains_key(&net)
+    }
+
+    /// Return values for all the prefixes in the table.
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.0.values()
+    }
+
+    /// Retain only the entries that satisfy the predicate.
+    pub fn retain<F: FnMut(&N, &T) -> bool>(&mut self, mut f: F) {
+        self.0.retain(|k, v| f(k, v));
+    }
+
     /// Iterate over all gaps with a specific prefix length.
     pub fn gaps_with_prefix_len(&self, prefix: N, prefix_len: u8) -> impl Iterator<Item = N> + '_ {
-        self.gaps(prefix, Some(prefix_len))
-            .flat_map(move |prefix| exact_prefixes(prefix, prefix_len))
+        let prefix: N = prefix.into();
+
+        let mut todo = std::iter::once(prefix).collect::<std::collections::BTreeSet<_>>();
+        // for each side, check if it is in the table
+        // if it has some children in the table, add it to the todo list
+        // if it has no children in the table, yield it
+        std::iter::from_fn(move || {
+            while let Some(prefix) = todo.pop_first() {
+                // If the prefix is the right length, then we can either yield it
+                // or skip it if it exists or has children
+                if prefix.prefix() == prefix_len {
+                    if self.iter_prefix(prefix).next().is_none() {
+                        return Some(prefix);
+                    }
+                    continue;
+                }
+
+                assert!(prefix.prefix() < prefix_len);
+
+                let a = prefix.with_prefix_len(prefix.prefix() + 1);
+                let b = prefix
+                    .toggle_bit(prefix.prefix())
+                    .with_prefix_len(prefix.prefix() + 1);
+
+                if !self.contains(b) {
+                    todo.insert(b);
+                }
+
+                if !self.contains(a) {
+                    todo.insert(a);
+                }
+            }
+            None
+        })
+
     }
 
     /// Find all unassigned IPs in the given prefix.
@@ -526,8 +575,10 @@ impl<N: Subnet, T> IpTable<N, T> {
 /// If parent is 192.168.2.0/24, and child is 192.168.2.196/26
 ///
 /// Then this will yield:
-/// 192.168.2.0/25
 /// 192.168.2.128/26
+/// 192.168.2.0/25
+///
+/// This will yield the shortest prefixes first.
 ///
 /// # Arguments
 /// * `prefix` - The parent prefix
