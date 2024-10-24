@@ -569,6 +569,7 @@ pub fn exact_prefixes<N: Subnet>(prefix: N, prefix_len: u8) -> impl Iterator<Ite
     todo.push_back(prefix);
     std::iter::from_fn(move || {
         while let Some(prefix) = todo.pop_front() {
+            assert!(todo.len() < 100, "todo: {:?}", todo);
             if prefix.prefix() == prefix_len {
                 return Some(prefix);
             }
@@ -578,8 +579,10 @@ pub fn exact_prefixes<N: Subnet>(prefix: N, prefix_len: u8) -> impl Iterator<Ite
                 .toggle_bit(prefix.prefix())
                 .with_prefix_len(prefix.prefix() + 1);
 
-            todo.push_back(a);
-            todo.push_back(b);
+            assert_ne!(a, b);
+
+            todo.push_front(b);
+            todo.push_front(a);
         }
         None
     })
@@ -813,6 +816,40 @@ mod tests {
                 "192.168.2.192/26".parse().unwrap()
             ]
         );
+
+        let net = "2001:db8::/64".parse::<Ipv6Network>().unwrap();
+        assert_eq!(
+            exact_prefixes(net, 64).collect::<Vec<_>>(),
+            vec![net.clone()]
+        );
+
+        assert_eq!(
+            exact_prefixes(net, 65).collect::<Vec<_>>(),
+            vec![
+                "2001:db8::/65".parse().unwrap(),
+                "2001:db8:0:0:8000::/65".parse().unwrap()
+            ]
+        );
+
+        assert_eq!(
+            exact_prefixes(net, 66).collect::<Vec<_>>(),
+            vec![
+                "2001:db8::/66".parse().unwrap(),
+                "2001:db8:0:0:4000::/66".parse().unwrap(),
+                "2001:db8:0:0:8000::/66".parse().unwrap(),
+                "2001:db8:0:0:c000::/66".parse().unwrap()
+            ]
+        );
+
+        assert_eq!(
+            exact_prefixes(net, 128).take(4).collect::<Vec<_>>(),
+            vec![
+                "2001:db8::/128".parse().unwrap(),
+                "2001:db8::1/128".parse().unwrap(),
+                "2001:db8::2/128".parse().unwrap(),
+                "2001:db8::3/128".parse().unwrap()
+            ]
+        );
     }
 
     #[test]
@@ -857,6 +894,14 @@ mod tests {
         );
         assert_eq!(
             "192.168.2.1".parse::<IpAddr>().unwrap(),
+            gaps.next().unwrap()
+        );
+
+        let net: Ipv6Network = "2001:db8::/64".parse().unwrap();
+
+        let mut gaps = table.gap_ips_in_prefix(net.into());
+        assert_eq!(
+            "2001:db8::".parse::<IpAddr>().unwrap(),
             gaps.next().unwrap()
         );
     }
