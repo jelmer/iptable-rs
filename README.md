@@ -1,6 +1,6 @@
 # IPTable
 
-This crate contains an efficient data structure for storing and querying values by CIDR.
+This create contains an efficient data structure for storing and querying values by CIDR.
 
 # Examples
 
