@@ -109,7 +109,7 @@ impl Subnet for Ipv4Network {
     }
 
     fn network(self) -> Ipv4Addr {
-        Ipv4Network::network(self)
+        Ipv4Network::network(&self)
     }
 }
 
