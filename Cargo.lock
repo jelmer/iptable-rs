@@ -207,16 +207,13 @@ checksum = "fbf6a919d6cf397374f7dfeeea91d974c7c0a7221d0d0f4f20d859d329e53fcc"
 
 [[package]]
 name = "ipnetwork"
-version = "0.20.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf466541e9d546596ee94f9f69590f89473455f88372423e0008fc1a7daf100e"
-dependencies = [
- "serde",
-]
+checksum = "2f7d1e51dceb94e362a3bd4849c5b8b44989faf8b66998fc0a44ff11923393c9"
 
 [[package]]
 name = "iptable"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "criterion",
  "ipnetwork",
