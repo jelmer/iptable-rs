@@ -287,7 +287,7 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     }
 
     /// Get the entry for the given network.
-    pub fn entry(&mut self, net: N) -> std::collections::btree_map::Entry<N, T> {
+    pub fn entry(&mut self, net: N) -> std::collections::btree_map::Entry<'_, N, T> {
         self.0.entry(net)
     }
 
@@ -451,7 +451,7 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
 
     /// Iterate over all gaps with a specific prefix length.
     pub fn gaps_with_prefix_len(&self, prefix: N, prefix_len: u8) -> impl Iterator<Item = N> + '_ {
-        let prefix: N = prefix.into();
+        let prefix: N = prefix;
 
         let mut todo = std::iter::once(prefix).collect::<std::collections::BTreeSet<_>>();
         // for each side, check if it is in the table
