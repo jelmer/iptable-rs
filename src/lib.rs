@@ -993,4 +993,156 @@ mod tests {
 
         assert_eq!(occupied, vec!["192.168.0.0/23".parse().unwrap(),]);
     }
+
+    #[test]
+    fn test_partial_eq() {
+        let mut table1 = IpTable::new();
+        let mut table2 = IpTable::new();
+
+        let net1: IpNetwork = "192.168.0.0/24".parse().unwrap();
+        table1.insert(net1, 42);
+        table2.insert(net1, 42);
+
+        assert_eq!(table1, table2);
+
+        let net2: IpNetwork = "192.168.1.0/24".parse().unwrap();
+        table2.insert(net2, 43);
+
+        assert_ne!(table1, table2);
+    }
+
+    #[test]
+    fn test_debug_fmt() {
+        let mut table = IpTable::new();
+        let net: IpNetwork = "192.168.0.0/24".parse().unwrap();
+        table.insert(net, 42);
+
+        let debug_str = format!("{:?}", table);
+        let expected = "{V4(Ipv4Network { addr: 192.168.0.0, prefix: 24 }): 42}";
+        assert_eq!(debug_str, expected);
+
+        let empty_table = IpTable::<i32>::new();
+        let empty_debug = format!("{:?}", empty_table);
+        assert_eq!(empty_debug, "{}");
+    }
+
+    #[test]
+    fn test_ipv6_is_subnet_of() {
+        let net1: Ipv6Network = "2001:db8::/32".parse().unwrap();
+        let net2: Ipv6Network = "2001:db8::/64".parse().unwrap();
+        let net3: Ipv6Network = "2001:db9::/64".parse().unwrap();
+
+        assert!(net2.is_subnet_of(net1));
+        assert!(!net1.is_subnet_of(net2));
+        assert!(!net3.is_subnet_of(net1));
+    }
+
+    #[test]
+    fn test_iter_subprefixes() {
+        let mut table = IpTable::new();
+        let parent: IpNetwork = "192.168.0.0/16".parse().unwrap();
+        let child1: IpNetwork = "192.168.1.0/24".parse().unwrap();
+        let child2: IpNetwork = "192.168.2.0/24".parse().unwrap();
+
+        table.insert(parent, 1);
+        table.insert(child1, 2);
+        table.insert(child2, 3);
+
+        let subprefixes = table.iter_subprefixes(parent).collect::<Vec<_>>();
+        assert_eq!(subprefixes, vec![(&child1, &2), (&child2, &3)]);
+
+        let empty_table = IpTable::<i32>::new();
+        let empty_subs = empty_table.iter_subprefixes(parent).collect::<Vec<_>>();
+        assert_eq!(empty_subs, vec![]);
+    }
+
+    #[test]
+    fn test_ipv6_last() {
+        let net: Ipv6Network = "2001:db8::/64".parse().unwrap();
+        let last = net.last();
+
+        assert_eq!(last.prefix(), 64);
+        assert_ne!(last.ip(), net.ip());
+
+        let net_full: Ipv6Network = "2001:db8::ffff:ffff:ffff:ffff/64".parse().unwrap();
+        let last_full = net_full.last();
+        assert_eq!(last_full.ip(), last.ip());
+    }
+
+    #[test]
+    fn test_ipv4_last() {
+        let net: Ipv4Network = "192.168.1.0/24".parse().unwrap();
+        let last = net.last();
+
+        assert_eq!(last.prefix(), 24);
+        assert_ne!(last.ip(), net.ip());
+
+        let net_full: Ipv4Network = "192.168.1.255/24".parse().unwrap();
+        let last_full = net_full.last();
+        assert_eq!(last_full.ip(), last.ip());
+    }
+
+    #[test]
+    fn test_ipv6_toggle_bit() {
+        let net: Ipv6Network = "2001:db8::/64".parse().unwrap();
+        let toggled = net.toggle_bit(63);
+
+        assert_ne!(toggled, net);
+        assert_eq!(toggled.prefix(), net.prefix());
+
+        let toggled_back = toggled.toggle_bit(63);
+        assert_eq!(toggled_back, net);
+    }
+
+    #[test]
+    fn test_ipv6_addr_size() {
+        let net: Ipv6Network = "2001:db8::/64".parse().unwrap();
+        assert_eq!(net.addr_size(), 128);
+    }
+
+    #[test]
+    fn test_ipv4_addr_size() {
+        let net: Ipv4Network = "192.168.1.0/24".parse().unwrap();
+        assert_eq!(net.addr_size(), 32);
+    }
+
+    #[test]
+    fn test_values() {
+        let mut table = IpTable::new();
+        let net1: IpNetwork = "192.168.0.0/24".parse().unwrap();
+        let net2: IpNetwork = "192.168.1.0/24".parse().unwrap();
+
+        table.insert(net1, 42);
+        table.insert(net2, 43);
+
+        let values = table.values().collect::<Vec<_>>();
+        assert_eq!(values.len(), 2);
+        assert!(values.contains(&&42));
+        assert!(values.contains(&&43));
+
+        let empty_table = IpTable::<i32>::new();
+        let empty_values = empty_table.values().collect::<Vec<_>>();
+        assert_eq!(empty_values.len(), 0);
+    }
+
+    #[test]
+    fn test_surrounding_gaps_edge_case() {
+        let parent: IpNetwork = "192.168.2.0/24".parse().unwrap();
+        let child: IpNetwork = "192.168.2.0/26".parse().unwrap();
+
+        let gaps = surrounding_gaps(parent, child, None).collect::<Vec<_>>();
+        assert_eq!(
+            gaps,
+            vec![
+                "192.168.2.128/25".parse().unwrap(),
+                "192.168.2.64/26".parse().unwrap(),
+            ]
+        );
+
+        let parent: IpNetwork = "192.168.2.0/24".parse().unwrap();
+        let child: IpNetwork = "192.168.2.128/25".parse().unwrap();
+
+        let gaps = surrounding_gaps(parent, child, None).collect::<Vec<_>>();
+        assert_eq!(gaps, vec!["192.168.2.0/25".parse().unwrap()]);
+    }
 }
