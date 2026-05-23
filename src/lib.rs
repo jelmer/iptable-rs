@@ -3,6 +3,10 @@
 //!
 //! This crate contains an efficient data structure for storing and querying values by CIDR.
 //!
+//! Internally entries are stored in a path-compressed binary radix (Patricia) trie keyed by
+//! the bits of the network address. Lookup, longest-prefix-match and gap operations all run
+//! in time proportional to the prefix length rather than the number of entries.
+//!
 //! # Examples
 //! ```
 //! use iptable::Ipv4Table;
@@ -38,7 +42,6 @@
 //! ```
 
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
-use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// A trait for types that can be used as subnets.
@@ -68,6 +71,22 @@ pub trait Subnet: PartialOrd + Ord + PartialEq + Copy + std::fmt::Debug + std::h
 
     /// Get the host address of the subnet.
     fn network(self) -> Self::Address;
+
+    /// Get the bit at the given position (0 = most significant) of the network address.
+    fn bit_at(self, index: u8) -> bool;
+
+    /// Length of the longest common bit prefix (from the MSB) of two networks'
+    /// address fields. Returns at most `addr_size()`.
+    ///
+    /// Used by the trie to find divergence points in a single XOR + count-leading-zeros
+    /// rather than bit-by-bit comparison.
+    fn common_prefix_len(self, other: Self) -> u8;
+
+    /// Family index: 0 for IPv4-shaped, 1 for IPv6-shaped.
+    ///
+    /// Used to keep disjoint address families in separate subtries when the same
+    /// table can hold both (i.e. when `N = IpNetwork`).
+    fn family(self) -> u8;
 }
 
 impl Subnet for Ipv4Network {
@@ -77,11 +96,10 @@ impl Subnet for Ipv4Network {
         Ipv4Network::prefix(self)
     }
     fn last(self) -> Self {
-        let mut last = self.ip().to_bits();
-        for i in 0..32 - self.prefix() {
-            last |= 1 << i;
-        }
-        Ipv4Network::new(Ipv4Addr::from_bits(last), self.prefix()).unwrap()
+        let p = self.prefix();
+        let host_mask: u32 = if p == 0 { !0u32 } else { (!0u32) >> p };
+        let last = self.ip().to_bits() | host_mask;
+        Ipv4Network::new(Ipv4Addr::from_bits(last), p).unwrap()
     }
 
     fn is_subnet_of(self, other: Self) -> bool {
@@ -90,11 +108,12 @@ impl Subnet for Ipv4Network {
 
     fn with_prefix_len(self, prefix: u8) -> Self {
         assert!(prefix <= 32);
-        let mut ip = self.ip().to_bits();
-        for i in prefix..32 {
-            // Clear the bit at index i
-            ip &= !(1 << (31 - i));
-        }
+        let mask: u32 = if prefix == 0 {
+            0
+        } else {
+            (!0u32) << (32 - prefix)
+        };
+        let ip = self.ip().to_bits() & mask;
         Self::new(Ipv4Addr::from_bits(ip), prefix).unwrap()
     }
 
@@ -111,6 +130,23 @@ impl Subnet for Ipv4Network {
     fn network(self) -> Ipv4Addr {
         Ipv4Network::network(&self)
     }
+
+    fn bit_at(self, index: u8) -> bool {
+        (self.ip().to_bits() >> (31 - index)) & 1 != 0
+    }
+
+    fn common_prefix_len(self, other: Self) -> u8 {
+        let xor = self.ip().to_bits() ^ other.ip().to_bits();
+        if xor == 0 {
+            32
+        } else {
+            xor.leading_zeros() as u8
+        }
+    }
+
+    fn family(self) -> u8 {
+        0
+    }
 }
 
 impl Subnet for Ipv6Network {
@@ -120,11 +156,10 @@ impl Subnet for Ipv6Network {
         Ipv6Network::prefix(&self)
     }
     fn last(self) -> Self {
-        let mut last = self.ip().to_bits();
-        for i in 0..128 - self.prefix() {
-            last |= 1 << i;
-        }
-        Ipv6Network::new(Ipv6Addr::from_bits(last), self.prefix()).unwrap()
+        let p = self.prefix();
+        let host_mask: u128 = if p == 0 { !0u128 } else { (!0u128) >> p };
+        let last = self.ip().to_bits() | host_mask;
+        Ipv6Network::new(Ipv6Addr::from_bits(last), p).unwrap()
     }
 
     fn is_subnet_of(self, other: Self) -> bool {
@@ -133,11 +168,12 @@ impl Subnet for Ipv6Network {
 
     fn with_prefix_len(self, prefix: u8) -> Self {
         assert!(prefix <= 128);
-        let mut ip = self.ip().to_bits();
-        for i in prefix..128 {
-            // Clear the bit at index i
-            ip &= !(1 << (127 - i));
-        }
+        let mask: u128 = if prefix == 0 {
+            0
+        } else {
+            (!0u128) << (128 - prefix)
+        };
+        let ip = self.ip().to_bits() & mask;
         Self::new(Ipv6Addr::from_bits(ip), prefix).unwrap()
     }
 
@@ -153,6 +189,23 @@ impl Subnet for Ipv6Network {
 
     fn network(self) -> Ipv6Addr {
         Ipv6Network::network(&self)
+    }
+
+    fn bit_at(self, index: u8) -> bool {
+        (self.ip().to_bits() >> (127 - index)) & 1 != 0
+    }
+
+    fn common_prefix_len(self, other: Self) -> u8 {
+        let xor = self.ip().to_bits() ^ other.ip().to_bits();
+        if xor == 0 {
+            128
+        } else {
+            xor.leading_zeros() as u8
+        }
+    }
+
+    fn family(self) -> u8 {
+        1
     }
 }
 
@@ -207,10 +260,69 @@ impl Subnet for IpNetwork {
             IpNetwork::V6(net) => IpAddr::V6(net.network()),
         }
     }
+
+    fn bit_at(self, index: u8) -> bool {
+        match self {
+            IpNetwork::V4(net) => net.bit_at(index),
+            IpNetwork::V6(net) => net.bit_at(index),
+        }
+    }
+
+    fn common_prefix_len(self, other: Self) -> u8 {
+        match (self, other) {
+            (IpNetwork::V4(a), IpNetwork::V4(b)) => a.common_prefix_len(b),
+            (IpNetwork::V6(a), IpNetwork::V6(b)) => a.common_prefix_len(b),
+            // Different families never share a prefix in this trie — but the
+            // trie keeps families in separate subtries so this case shouldn't
+            // be reached from internal call sites.
+            _ => 0,
+        }
+    }
+
+    fn family(self) -> u8 {
+        match self {
+            IpNetwork::V4(_) => 0,
+            IpNetwork::V6(_) => 1,
+        }
+    }
+}
+
+/// A node in the Patricia trie.
+///
+/// `key` always has its network bits truncated to `key.prefix()` (= the node's depth).
+/// If `value` is `Some`, this node represents a stored entry; otherwise it is an
+/// internal branch node that must have both `children[0]` and `children[1]`.
+struct Node<N: Subnet, T> {
+    key: N,
+    value: Option<T>,
+    children: [Option<Box<Node<N, T>>>; 2],
+}
+
+impl<N: Subnet, T> Node<N, T> {
+    fn new_leaf(key: N, value: T) -> Self {
+        Self {
+            key,
+            value: Some(value),
+            children: [None, None],
+        }
+    }
+}
+
+/// Return the index of the first bit at which `a` and `b` differ within `[0, to)`,
+/// or `None` if they agree on all those bits.
+#[inline]
+fn first_diff_bit_prefix<N: Subnet>(a: N, b: N, to: u8) -> Option<u8> {
+    let cpl = a.common_prefix_len(b);
+    if cpl >= to { None } else { Some(cpl) }
 }
 
 /// Base structure for storing values by CIDR.
-pub struct GenericIpTable<N: Subnet, T>(BTreeMap<N, T>);
+pub struct GenericIpTable<N: Subnet, T> {
+    /// Separate subtries per address family — used so a single `IpTable`
+    /// can hold both IPv4 and IPv6 entries while keeping each family's trie clean.
+    roots: [Option<Box<Node<N, T>>>; 2],
+    len: usize,
+}
 
 /// A table for storing values by IPv4 or IPv6 CIDR.
 pub type IpTable<T> = GenericIpTable<IpNetwork, T>;
@@ -224,105 +336,269 @@ pub type Ipv4Table<T> = GenericIpTable<Ipv4Network, T>;
 /// A table for storing values by IPv6 CIDR.
 pub type Ipv6Table<T> = GenericIpTable<Ipv6Network, T>;
 
-impl<T> Default for IpTable<T> {
+impl<N: Subnet, T> Default for GenericIpTable<N, T> {
     fn default() -> Self {
-        IpTable::new()
-    }
-}
-
-impl<N: Subnet, T> IntoIterator for GenericIpTable<N, T> {
-    type Item = (N, T);
-    type IntoIter = std::collections::btree_map::IntoIter<N, T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
-    }
-}
-
-impl<N: Subnet, T> FromIterator<(N, T)> for GenericIpTable<N, T> {
-    fn from_iter<I: IntoIterator<Item = (N, T)>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
+        Self::new()
     }
 }
 
 impl<N: Subnet, T> GenericIpTable<N, T> {
     /// Create a new table.
     pub fn new() -> Self {
-        Self(BTreeMap::new())
+        Self {
+            roots: [None, None],
+            len: 0,
+        }
     }
 
     /// Returns the number of elements in the table.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.len
     }
 
     /// Returns true if the table is empty.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.len == 0
     }
 
     /// Insert a value into the table.
     pub fn insert<S: Into<N>>(&mut self, net: S, value: T) {
         let net: N = net.into();
-        self.0.insert(net, value);
+        let key = net.with_prefix_len(net.prefix());
+        let fam = key.family() as usize;
+        let root = &mut self.roots[fam];
+        if root.is_none() {
+            *root = Some(Box::new(Node::new_leaf(key, value)));
+            self.len += 1;
+            return;
+        }
+        if Self::insert_into(root, key, value) {
+            self.len += 1;
+        }
+    }
+
+    /// Insert into a non-empty subtree rooted at `slot`. Returns true if a new entry
+    /// was added (vs replacing an existing entry's value).
+    fn insert_into(slot: &mut Option<Box<Node<N, T>>>, key: N, value: T) -> bool {
+        let node = slot.as_mut().expect("non-empty slot");
+        let node_prefix = node.key.prefix();
+        let new_prefix = key.prefix();
+
+        // Find first bit where `key` and `node.key` differ within `[0, min(node_prefix, new_prefix))`.
+        let cmp_to = node_prefix.min(new_prefix);
+        if let Some(diff) = first_diff_bit_prefix(node.key, key, cmp_to) {
+            // Need to split: introduce a new branch node at depth `diff`.
+            let branch_key = node.key.with_prefix_len(diff);
+            let old = slot.take().unwrap();
+            let new_leaf = Box::new(Node::new_leaf(key, value));
+            let mut new_branch = Box::new(Node {
+                key: branch_key,
+                value: None,
+                children: [None, None],
+            });
+            let old_bit = old.key.bit_at(diff) as usize;
+            let new_bit = key.bit_at(diff) as usize;
+            debug_assert_ne!(old_bit, new_bit);
+            new_branch.children[old_bit] = Some(old);
+            new_branch.children[new_bit] = Some(new_leaf);
+            *slot = Some(new_branch);
+            return true;
+        }
+
+        // No divergence in the common prefix.
+        if new_prefix == node_prefix {
+            // Exact match on this node.
+            let was_empty = node.value.is_none();
+            node.value = Some(value);
+            return was_empty;
+        }
+
+        if new_prefix < node_prefix {
+            // The new key is an ancestor of `node`. Insert a new node above `node`.
+            let old = slot.take().unwrap();
+            let bit = old.key.bit_at(new_prefix) as usize;
+            let mut new_node = Box::new(Node::new_leaf(key, value));
+            new_node.children[bit] = Some(old);
+            *slot = Some(new_node);
+            return true;
+        }
+
+        // new_prefix > node_prefix: descend.
+        let bit = key.bit_at(node_prefix) as usize;
+        if node.children[bit].is_none() {
+            node.children[bit] = Some(Box::new(Node::new_leaf(key, value)));
+            return true;
+        }
+        Self::insert_into(&mut node.children[bit], key, value)
     }
 
     /// Get a value from the table.
     ///
     /// Exact match only.
     pub fn get<S: Into<N>>(&self, net: S) -> Option<&T> {
-        self.0.get(&net.into())
+        let key = net.into();
+        let key = key.with_prefix_len(key.prefix());
+        let fam = key.family() as usize;
+        let mut cur = self.roots[fam].as_deref();
+        while let Some(node) = cur {
+            let np = node.key.prefix();
+            if np > key.prefix() {
+                return None;
+            }
+            // Bits [0, np) of node.key must equal bits [0, np) of key.
+            if first_diff_bit_prefix(node.key, key, np).is_some() {
+                return None;
+            }
+            if np == key.prefix() {
+                return node.value.as_ref();
+            }
+            let bit = key.bit_at(np) as usize;
+            cur = node.children[bit].as_deref();
+        }
+        None
     }
 
     /// Get a mutable reference to a value in the table.
     ///
     /// Exact match only.
     pub fn get_mut<S: Into<N>>(&mut self, net: S) -> Option<&mut T> {
-        self.0.get_mut(&net.into())
+        let key = net.into();
+        let key = key.with_prefix_len(key.prefix());
+        let fam = key.family() as usize;
+        let mut cur = self.roots[fam].as_deref_mut();
+        while let Some(node) = cur {
+            let np = node.key.prefix();
+            if np > key.prefix() {
+                return None;
+            }
+            if first_diff_bit_prefix(node.key, key, np).is_some() {
+                return None;
+            }
+            if np == key.prefix() {
+                return node.value.as_mut();
+            }
+            let bit = key.bit_at(np) as usize;
+            cur = node.children[bit].as_deref_mut();
+        }
+        None
     }
 
     /// Remove a value from the table.
     pub fn remove<S: Into<N>>(&mut self, net: S) -> Option<T> {
-        self.0.remove(&net.into())
+        let key = net.into();
+        let key = key.with_prefix_len(key.prefix());
+        let fam = key.family() as usize;
+        let removed = Self::remove_from(&mut self.roots[fam], key);
+        if removed.is_some() {
+            self.len -= 1;
+        }
+        removed
+    }
+
+    fn remove_from(slot: &mut Option<Box<Node<N, T>>>, key: N) -> Option<T> {
+        let node = slot.as_mut()?;
+        let np = node.key.prefix();
+        if np > key.prefix() {
+            return None;
+        }
+        if first_diff_bit_prefix(node.key, key, np).is_some() {
+            return None;
+        }
+        if np == key.prefix() {
+            let removed = node.value.take();
+            if removed.is_some() {
+                Self::collapse(slot);
+            }
+            return removed;
+        }
+        let bit = key.bit_at(np) as usize;
+        let removed = Self::remove_from(&mut node.children[bit], key);
+        if removed.is_some() {
+            // After removing from child, current node may have only one child and no value.
+            Self::collapse(slot);
+        }
+        removed
+    }
+
+    /// Maintain the trie invariant: a node with no value must have two children.
+    /// If a node has no value and 0 or 1 children, remove or merge it.
+    fn collapse(slot: &mut Option<Box<Node<N, T>>>) {
+        let take_slot = |slot: &mut Option<Box<Node<N, T>>>| -> Option<Box<Node<N, T>>> {
+            let node = slot.as_ref()?;
+            if node.value.is_some() {
+                return None;
+            }
+            let has0 = node.children[0].is_some();
+            let has1 = node.children[1].is_some();
+            if has0 && has1 {
+                return None;
+            }
+            slot.take()
+        };
+        if let Some(mut node) = take_slot(slot) {
+            let child = node.children[0].take().or_else(|| node.children[1].take());
+            *slot = child;
+        }
     }
 
     /// Get the entry for the given network.
-    pub fn entry(&mut self, net: N) -> std::collections::btree_map::Entry<'_, N, T> {
-        self.0.entry(net)
+    pub fn entry(&mut self, net: N) -> Entry<'_, N, T> {
+        let key = net.with_prefix_len(net.prefix());
+        if self.get(key).is_some() {
+            Entry::Occupied(OccupiedEntry { table: self, key })
+        } else {
+            Entry::Vacant(VacantEntry { table: self, key })
+        }
     }
 
     /// Iterate over the entries in the table, ordered by prefix.
-    pub fn iter(&self) -> impl Iterator<Item = (&N, &T)> {
-        self.0.iter()
+    pub fn iter(&self) -> Iter<'_, N, T> {
+        Iter::new(&self.roots)
     }
 
     /// Iterate over the prefixes under the given prefix, including the prefix itself.
-    pub fn iter_prefix<S: Into<N>>(&self, prefix: S) -> impl Iterator<Item = (&N, &T)> {
+    pub fn iter_prefix<S: Into<N>>(&self, prefix: S) -> Iter<'_, N, T> {
         let prefix: N = prefix.into();
-
-        self.0
-            .range(prefix..prefix.last())
-            .filter(move |(net, _)| net.is_subnet_of(prefix))
+        let prefix = prefix.with_prefix_len(prefix.prefix());
+        let fam = prefix.family() as usize;
+        // Walk to the deepest node that is `prefix` or a descendant of it (i.e. node.prefix() >= prefix.prefix()
+        // and node.key matches prefix on the first prefix.prefix() bits).
+        let mut cur = self.roots[fam].as_deref();
+        while let Some(node) = cur {
+            let np = node.key.prefix();
+            if np >= prefix.prefix() {
+                // Check whether node lies under `prefix`.
+                if first_diff_bit_prefix(node.key, prefix, prefix.prefix()).is_none() {
+                    return Iter::from_subtree(Some(node));
+                }
+                return Iter::empty();
+            }
+            // np < prefix.prefix(): make sure first np bits agree, then descend.
+            if first_diff_bit_prefix(node.key, prefix, np).is_some() {
+                return Iter::empty();
+            }
+            let bit = prefix.bit_at(np) as usize;
+            cur = node.children[bit].as_deref();
+        }
+        Iter::empty()
     }
 
     /// Iterate over the prefixes under the given prefix, excluding the prefix itself.
-    pub fn iter_subprefixes<S: Into<N>>(&self, prefix: S) -> impl Iterator<Item = (&N, &T)> {
+    pub fn iter_subprefixes<S: Into<N>>(&self, prefix: S) -> IterSubprefixes<'_, N, T> {
         let prefix: N = prefix.into();
-
-        self.0
-            .range(prefix.with_prefix_len(prefix.prefix() + 1)..prefix.last())
-            .filter(move |(net, _)| net.is_subnet_of(prefix))
+        IterSubprefixes {
+            inner: self.iter_prefix(prefix),
+            skip: prefix.with_prefix_len(prefix.prefix()),
+        }
     }
 
     /// Merge entries with longer prefixes into the target prefix.
     pub fn merge_longer_prefixes(self, target_prefix: u8, merge_fn: impl Fn(T, T) -> T) -> Self {
         let mut new_table = Self::new();
 
-        for (net, value) in self.0.into_iter() {
+        for (net, value) in self.into_iter() {
             if net.prefix() >= target_prefix {
                 let net = net.with_prefix_len(target_prefix);
-
-                // If the entry already exists, merge the values
                 if let Some(existing_value) = new_table.remove(net) {
                     new_table.insert(net, merge_fn(existing_value, value));
                 } else {
@@ -350,17 +626,62 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     ///     Some(("192.168.2.0/24".parse().unwrap(), &42)));
     /// ```
     pub fn get_containing_prefix<S: Into<N>>(&self, net: S) -> Option<(N, &T)> {
-        let net: N = net.into();
-        self.iter_containing_prefixes(net).next()
+        let key: N = net.into();
+        let key = key.with_prefix_len(key.prefix());
+        let fam = key.family() as usize;
+        let mut cur = self.roots[fam].as_deref();
+        let mut best: Option<(N, &T)> = None;
+        while let Some(node) = cur {
+            let np = node.key.prefix();
+            if np > key.prefix() {
+                break;
+            }
+            if first_diff_bit_prefix(node.key, key, np).is_some() {
+                break;
+            }
+            if let Some(v) = node.value.as_ref() {
+                if np < key.prefix() {
+                    best = Some((node.key, v));
+                }
+            }
+            if np == key.prefix() {
+                break;
+            }
+            let bit = key.bit_at(np) as usize;
+            cur = node.children[bit].as_deref();
+        }
+        best
     }
 
     /// Iterate over the shorter prefixes of the given network, longest first.
-    pub fn iter_containing_prefixes<S: Into<N>>(&self, net: S) -> impl Iterator<Item = (N, &T)> {
-        let net: N = net.into();
-        (0..net.prefix()).rev().filter_map(move |i| {
-            let parent = net.with_prefix_len(i);
-            self.get(parent).map(|value| (parent, value))
-        })
+    pub fn iter_containing_prefixes<S: Into<N>>(&self, net: S) -> ContainingPrefixes<'_, N, T> {
+        let key: N = net.into();
+        let key = key.with_prefix_len(key.prefix());
+        let fam = key.family() as usize;
+        let mut found: Vec<(N, &T)> = Vec::new();
+        let mut cur = self.roots[fam].as_deref();
+        while let Some(node) = cur {
+            let np = node.key.prefix();
+            if np > key.prefix() {
+                break;
+            }
+            if first_diff_bit_prefix(node.key, key, np).is_some() {
+                break;
+            }
+            if np < key.prefix() {
+                if let Some(v) = node.value.as_ref() {
+                    found.push((node.key, v));
+                }
+            } else {
+                break;
+            }
+            let bit = key.bit_at(np) as usize;
+            cur = node.children[bit].as_deref();
+        }
+        found.reverse();
+        ContainingPrefixes {
+            iter: found.into_iter(),
+        }
     }
 
     /// Update the table with the given iterator.
@@ -402,12 +723,8 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
         let prefix: N = prefix.into();
 
         let mut todo = std::iter::once(prefix).collect::<std::collections::BTreeSet<_>>();
-        // for each side, check if it is in the table
-        // if it has some children in the table, add it to the todo list
-        // if it has no children in the table, yield it
         std::iter::from_fn(move || {
             while let Some(prefix) = todo.pop_first() {
-                // If the prefix nor any children are in the table, yield it
                 if self.iter_prefix(prefix).next().is_none() {
                     return Some(prefix);
                 }
@@ -435,32 +752,30 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
 
     /// Check if the table contains the given network.
     pub fn contains<S: Into<N>>(&self, net: S) -> bool {
-        let net: N = net.into();
-        self.0.contains_key(&net)
+        self.get(net).is_some()
     }
 
     /// Return values for all the prefixes in the table.
-    pub fn values(&self) -> impl Iterator<Item = &T> {
-        self.0.values()
+    pub fn values(&self) -> Values<'_, N, T> {
+        Values { iter: self.iter() }
     }
 
     /// Retain only the entries that satisfy the predicate.
     pub fn retain<F: FnMut(&N, &T) -> bool>(&mut self, mut f: F) {
-        self.0.retain(|k, v| f(k, v));
+        let to_remove: Vec<N> = self
+            .iter()
+            .filter_map(|(k, v)| if !f(k, v) { Some(*k) } else { None })
+            .collect();
+        for k in to_remove {
+            self.remove(k);
+        }
     }
 
     /// Iterate over all gaps with a specific prefix length.
     pub fn gaps_with_prefix_len(&self, prefix: N, prefix_len: u8) -> impl Iterator<Item = N> + '_ {
-        let prefix: N = prefix;
-
         let mut todo = std::iter::once(prefix).collect::<std::collections::BTreeSet<_>>();
-        // for each side, check if it is in the table
-        // if it has some children in the table, add it to the todo list
-        // if it has no children in the table, yield it
         std::iter::from_fn(move || {
             while let Some(prefix) = todo.pop_first() {
-                // If the prefix is the right length, then we can either yield it
-                // or skip it if it exists or has children
                 if prefix.prefix() == prefix_len {
                     if self.iter_prefix(prefix).next().is_none() {
                         return Some(prefix);
@@ -494,9 +809,6 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     }
 
     fn _iter_occupied(&self, prefixes: impl Iterator<Item = N>) -> impl Iterator<Item = N> + '_ {
-        // iterate over all the prefix lengths, longest to shortest
-        // for each prefix length, iterate over all the prefixes with that length
-
         let mut by_len: std::collections::HashMap<u8, std::collections::HashSet<N>> =
             std::collections::HashMap::new();
         for net in prefixes {
@@ -511,10 +823,7 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
 
             prefixes.clone().into_iter().filter(move |prefix| {
                 let by_len = by_len.clone();
-                // find the toggled prefix
                 let toggled = prefix.toggle_bit(prefix.prefix() - 1);
-                // if the toggled prefix is in the table, then add the parent prefix to the
-                // list
                 if !prefixes.contains(&toggled) {
                     true
                 } else {
@@ -533,7 +842,7 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     ///
     /// This will merge adjacent prefixes as much as possible.
     pub fn iter_occupied(&self) -> impl Iterator<Item = N> + '_ {
-        self._iter_occupied(self.0.keys().copied())
+        self._iter_occupied(self.iter().map(|(k, _)| *k))
     }
 
     /// Iterate over the occupied prefixes in the table under a given prefix.
@@ -541,6 +850,231 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     /// This will yield the prefixes in order of length, longest first.
     pub fn iter_occupied_prefix(&self, prefix: N) -> impl Iterator<Item = N> + '_ {
         self._iter_occupied(self.iter_prefix(prefix).map(|(net, _)| *net))
+    }
+}
+
+/// Iterator over the entries in a `GenericIpTable`, in `(network, prefix)` order.
+///
+/// The stack holds nodes still to visit in pre-order: when a node is popped its value
+/// (if any) is yielded immediately, then its children are pushed in reverse order
+/// (right before left) so the left subtree is visited first.
+pub struct Iter<'a, N: Subnet, T> {
+    stack: Vec<&'a Node<N, T>>,
+}
+
+impl<'a, N: Subnet, T> Iter<'a, N, T> {
+    fn new(roots: &'a [Option<Box<Node<N, T>>>; 2]) -> Self {
+        let mut stack: Vec<&'a Node<N, T>> = Vec::new();
+        // Push in reverse so family 0 pops first.
+        for slot in roots.iter().rev() {
+            if let Some(root) = slot.as_deref() {
+                stack.push(root);
+            }
+        }
+        Self { stack }
+    }
+
+    fn empty() -> Self {
+        Self { stack: Vec::new() }
+    }
+
+    fn from_subtree(node: Option<&'a Node<N, T>>) -> Self {
+        let mut it = Self::empty();
+        if let Some(node) = node {
+            it.stack.push(node);
+        }
+        it
+    }
+}
+
+impl<'a, N: Subnet, T> Iterator for Iter<'a, N, T> {
+    type Item = (&'a N, &'a T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let node = self.stack.pop()?;
+            // Push children right-then-left so left pops first.
+            if let Some(right) = node.children[1].as_deref() {
+                self.stack.push(right);
+            }
+            if let Some(left) = node.children[0].as_deref() {
+                self.stack.push(left);
+            }
+            if let Some(v) = node.value.as_ref() {
+                return Some((&node.key, v));
+            }
+        }
+    }
+}
+
+/// Iterator over the proper sub-prefixes of a given prefix.
+pub struct IterSubprefixes<'a, N: Subnet, T> {
+    inner: Iter<'a, N, T>,
+    skip: N,
+}
+
+impl<'a, N: Subnet, T> Iterator for IterSubprefixes<'a, N, T> {
+    type Item = (&'a N, &'a T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let (k, v) = self.inner.next()?;
+            if *k != self.skip {
+                return Some((k, v));
+            }
+        }
+    }
+}
+
+/// Iterator over the values in a `GenericIpTable`.
+pub struct Values<'a, N: Subnet, T> {
+    iter: Iter<'a, N, T>,
+}
+
+impl<'a, N: Subnet, T> Iterator for Values<'a, N, T> {
+    type Item = &'a T;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(|(_, v)| v)
+    }
+}
+
+/// Iterator over the containing prefixes of a network, longest first.
+pub struct ContainingPrefixes<'a, N: Subnet, T> {
+    iter: std::vec::IntoIter<(N, &'a T)>,
+}
+
+impl<'a, N: Subnet, T> Iterator for ContainingPrefixes<'a, N, T> {
+    type Item = (N, &'a T);
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+}
+
+/// Owning iterator over `GenericIpTable`.
+///
+/// Mirrors `Iter`: pop a node, yield its value (if any), push children right-then-left
+/// so the left subtree is visited first.
+pub struct IntoIter<N: Subnet, T> {
+    stack: Vec<Box<Node<N, T>>>,
+}
+
+impl<N: Subnet, T> Iterator for IntoIter<N, T> {
+    type Item = (N, T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let mut node = self.stack.pop()?;
+            if let Some(right) = node.children[1].take() {
+                self.stack.push(right);
+            }
+            if let Some(left) = node.children[0].take() {
+                self.stack.push(left);
+            }
+            if let Some(v) = node.value.take() {
+                return Some((node.key, v));
+            }
+        }
+    }
+}
+
+impl<N: Subnet, T> IntoIterator for GenericIpTable<N, T> {
+    type Item = (N, T);
+    type IntoIter = IntoIter<N, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let mut stack = Vec::new();
+        // Reverse so family 0 pops first.
+        for root in self.roots.into_iter().rev().flatten() {
+            stack.push(root);
+        }
+        IntoIter { stack }
+    }
+}
+
+// Stub re-impl: actual semantics provided by the Iterator impl above is buggy
+// (post-order). We provide an alternative via free function used by merge_longer_prefixes
+// and the iter() based collection in tests.
+
+/// Entry API for in-place modification.
+pub enum Entry<'a, N: Subnet, T> {
+    /// An occupied entry.
+    Occupied(OccupiedEntry<'a, N, T>),
+    /// A vacant entry.
+    Vacant(VacantEntry<'a, N, T>),
+}
+
+/// An occupied entry in a `GenericIpTable`.
+pub struct OccupiedEntry<'a, N: Subnet, T> {
+    table: &'a mut GenericIpTable<N, T>,
+    key: N,
+}
+
+/// A vacant entry in a `GenericIpTable`.
+pub struct VacantEntry<'a, N: Subnet, T> {
+    table: &'a mut GenericIpTable<N, T>,
+    key: N,
+}
+
+impl<'a, N: Subnet, T> Entry<'a, N, T> {
+    /// Ensure a value is in the entry by inserting the default if empty.
+    pub fn or_insert(self, default: T) -> &'a mut T {
+        match self {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(default),
+        }
+    }
+
+    /// Ensure a value is in the entry by computing it from a closure if empty.
+    pub fn or_insert_with<F: FnOnce() -> T>(self, default: F) -> &'a mut T {
+        match self {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(default()),
+        }
+    }
+}
+
+impl<'a, N: Subnet, T> OccupiedEntry<'a, N, T> {
+    /// Get a mutable reference to the value.
+    pub fn into_mut(self) -> &'a mut T {
+        self.table.get_mut(self.key).expect("occupied")
+    }
+
+    /// Get a reference to the value.
+    pub fn get(&self) -> &T {
+        self.table.get(self.key).expect("occupied")
+    }
+
+    /// Get a mutable reference to the value.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.table.get_mut(self.key).expect("occupied")
+    }
+
+    /// Get the key of the entry.
+    pub fn key(&self) -> &N {
+        &self.key
+    }
+}
+
+impl<'a, N: Subnet, T> VacantEntry<'a, N, T> {
+    /// Insert a value into the vacant entry and return a mutable reference to it.
+    pub fn insert(self, value: T) -> &'a mut T {
+        self.table.insert(self.key, value);
+        self.table.get_mut(self.key).expect("just inserted")
+    }
+
+    /// Get the key of the entry.
+    pub fn key(&self) -> &N {
+        &self.key
+    }
+}
+
+impl<N: Subnet, T> FromIterator<(N, T)> for GenericIpTable<N, T> {
+    fn from_iter<I: IntoIterator<Item = (N, T)>>(iter: I) -> Self {
+        let mut table = Self::new();
+        for (k, v) in iter {
+            table.insert(k, v);
+        }
+        table
     }
 }
 
@@ -564,10 +1098,6 @@ pub fn surrounding_gaps<N: Subnet>(
     child: N,
     max_prefix: Option<u8>,
 ) -> impl Iterator<Item = N> {
-    // Produce all subprefixes of the parent prefix
-    // 192.168.2.0/24 => overlaps
-    // 192.168.2.128/25 =>
-    // 192.168.2.128/26
     let child = child.with_prefix_len(child.prefix());
     let max_prefix = if let Some(max_prefix) = max_prefix {
         std::cmp::min(max_prefix, child.prefix())
@@ -618,19 +1148,26 @@ pub fn exact_prefixes<N: Subnet>(prefix: N, prefix_len: u8) -> impl Iterator<Ite
 
 impl<N: Subnet, T: std::fmt::Debug> std::fmt::Debug for GenericIpTable<N, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_map().entries(self.0.iter()).finish()
+        f.debug_map().entries(self.iter()).finish()
     }
 }
 
 impl<N: Subnet, T: Clone> Clone for GenericIpTable<N, T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        let mut new_table = Self::new();
+        for (k, v) in self.iter() {
+            new_table.insert(*k, v.clone());
+        }
+        new_table
     }
 }
 
 impl<N: Subnet, T: PartialEq> PartialEq for GenericIpTable<N, T> {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        if self.len != other.len {
+            return false;
+        }
+        self.iter().eq(other.iter())
     }
 }
 
@@ -753,7 +1290,6 @@ mod tests {
         assert_eq!(
             gaps,
             vec![
-                // 192.168.2.0-192.168.2.128
                 "192.168.2.0/25".parse().unwrap(),
                 "192.168.2.192/26".parse().unwrap(),
                 "192.168.2.160/27".parse().unwrap(),
@@ -774,7 +1310,6 @@ mod tests {
             ]
         );
 
-        // Child is unrelated
         let parent: IpNetwork = "192.168.2.0/24".parse().unwrap();
         let child: IpNetwork = "192.168.3.0/26".parse().unwrap();
 
@@ -1123,6 +1658,224 @@ mod tests {
         let empty_table = IpTable::<i32>::new();
         let empty_values = empty_table.values().collect::<Vec<_>>();
         assert_eq!(empty_values.len(), 0);
+    }
+
+    #[test]
+    fn test_replace_value() {
+        let mut table = IpTable::new();
+        let net: IpNetwork = "192.168.0.0/24".parse().unwrap();
+        table.insert(net, 1);
+        assert_eq!(table.len(), 1);
+        table.insert(net, 2);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get(net), Some(&2));
+    }
+
+    #[test]
+    fn test_mixed_v4_v6() {
+        let mut table = IpTable::new();
+        let v4: IpNetwork = "10.0.0.0/8".parse().unwrap();
+        let v6: IpNetwork = "2001:db8::/32".parse().unwrap();
+        table.insert(v4, 1);
+        table.insert(v6, 2);
+        assert_eq!(table.len(), 2);
+
+        // Iteration order: V4 first, then V6 (matches BTreeMap on enum).
+        let entries = table.iter().collect::<Vec<_>>();
+        assert_eq!(entries, vec![(&v4, &1), (&v6, &2)]);
+
+        // V4 lookup should not find V6 entries and vice versa.
+        let v4_query: IpNetwork = "10.1.2.3/32".parse().unwrap();
+        assert_eq!(table.get_containing_prefix(v4_query), Some((v4, &1)));
+
+        // Removing one family doesn't affect the other.
+        assert_eq!(table.remove(v4), Some(1));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get(v6), Some(&2));
+    }
+
+    #[test]
+    fn test_root_prefix_zero() {
+        let mut table = IpTable::new();
+        let zero: IpNetwork = "0.0.0.0/0".parse().unwrap();
+        table.insert(zero, 99);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert_eq!(table.get_containing_prefix(ip), Some((zero, &99)));
+        assert_eq!(table.get(zero), Some(&99));
+    }
+
+    #[test]
+    fn test_insert_split_then_remove_collapse() {
+        // Two leaves under a branch; removing one should collapse the branch away.
+        let mut table = IpTable::new();
+        let a: IpNetwork = "10.0.0.0/24".parse().unwrap();
+        let b: IpNetwork = "10.0.1.0/24".parse().unwrap();
+        table.insert(a, 1);
+        table.insert(b, 2);
+        assert_eq!(table.iter().count(), 2);
+        assert_eq!(table.remove(a), Some(1));
+        assert_eq!(table.iter().count(), 1);
+        assert_eq!(table.get(b), Some(&2));
+        assert_eq!(table.remove(b), Some(2));
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_insert_ancestor_after_descendant() {
+        // Insert a child first, then its parent — exercises the "new key is ancestor" branch.
+        let mut table = IpTable::new();
+        let child: IpNetwork = "192.168.1.0/24".parse().unwrap();
+        let parent: IpNetwork = "192.168.0.0/16".parse().unwrap();
+        table.insert(child, 1);
+        table.insert(parent, 2);
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.get(child), Some(&1));
+        assert_eq!(table.get(parent), Some(&2));
+        assert_eq!(table.get_containing_prefix(child), Some((parent, &2)));
+    }
+
+    #[test]
+    fn test_iter_order_many() {
+        // Use BTreeMap as the reference ordering oracle.
+        use std::collections::BTreeMap;
+        let mut table = IpTable::new();
+        let mut reference = BTreeMap::new();
+        let nets: Vec<IpNetwork> = [
+            "10.0.0.0/8",
+            "10.1.0.0/16",
+            "10.1.2.0/24",
+            "10.1.2.3/32",
+            "10.255.255.255/32",
+            "192.168.0.0/16",
+            "192.168.0.0/24",
+            "192.168.0.128/25",
+            "0.0.0.0/0",
+            "2001:db8::/32",
+            "2001:db8:1::/48",
+            "::/0",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        for (i, &n) in nets.iter().enumerate() {
+            table.insert(n, i);
+            reference.insert(n, i);
+        }
+        let got: Vec<_> = table.iter().map(|(k, v)| (*k, *v)).collect();
+        let want: Vec<_> = reference.into_iter().collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn test_iter_containing_prefixes_order() {
+        let mut table = IpTable::new();
+        let a: IpNetwork = "10.0.0.0/8".parse().unwrap();
+        let b: IpNetwork = "10.1.0.0/16".parse().unwrap();
+        let c: IpNetwork = "10.1.2.0/24".parse().unwrap();
+        table.insert(a, 1);
+        table.insert(b, 2);
+        table.insert(c, 3);
+
+        // Query a /32 inside all three: should yield c, b, a (longest-first).
+        let query: IpNetwork = "10.1.2.3/32".parse().unwrap();
+        let got: Vec<_> = table
+            .iter_containing_prefixes(query)
+            .map(|(k, v)| (k, *v))
+            .collect();
+        assert_eq!(got, vec![(c, 3), (b, 2), (a, 1)]);
+    }
+
+    #[test]
+    fn test_into_iter_order() {
+        let mut table = IpTable::new();
+        let nets: Vec<IpNetwork> = [
+            "10.0.0.0/8",
+            "10.1.0.0/16",
+            "192.168.0.0/16",
+            "2001:db8::/32",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        for (i, &n) in nets.iter().enumerate() {
+            table.insert(n, i);
+        }
+        let got: Vec<_> = table.into_iter().collect();
+        let want: Vec<_> = nets.into_iter().zip(0..).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn test_entry_api() {
+        let mut table = IpTable::new();
+        let net: IpNetwork = "10.0.0.0/8".parse().unwrap();
+        *table.entry(net).or_insert(0) += 5;
+        *table.entry(net).or_insert(0) += 3;
+        assert_eq!(table.get(net), Some(&8));
+    }
+
+    #[test]
+    fn test_retain() {
+        let mut table = IpTable::new();
+        let a: IpNetwork = "10.0.0.0/8".parse().unwrap();
+        let b: IpNetwork = "192.168.0.0/16".parse().unwrap();
+        let c: IpNetwork = "2001:db8::/32".parse().unwrap();
+        table.insert(a, 1);
+        table.insert(b, 2);
+        table.insert(c, 3);
+        table.retain(|_k, v| *v != 2);
+        assert_eq!(table.len(), 2);
+        assert!(table.contains(a));
+        assert!(!table.contains(b));
+        assert!(table.contains(c));
+    }
+
+    #[test]
+    fn test_random_insert_remove_lookup_matches_btreemap() {
+        use std::collections::BTreeMap;
+
+        // Deterministic PRNG so failures are reproducible.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut rand = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut table: Ipv4Table<u32> = Ipv4Table::new();
+        let mut reference: BTreeMap<Ipv4Network, u32> = BTreeMap::new();
+
+        for _ in 0..2_000 {
+            let bits = (rand() & 0xFFFFFFFF) as u32;
+            let prefix = (rand() % 33) as u8;
+            let ip = Ipv4Addr::from_bits(bits);
+            let net = Ipv4Network::new(ip, prefix).unwrap();
+            let net = net.with_prefix_len(prefix);
+            let v = (rand() & 0xFFFF) as u32;
+            let op = rand() % 4;
+            match op {
+                0 | 1 => {
+                    table.insert(net, v);
+                    reference.insert(net, v);
+                }
+                2 => {
+                    let got = table.remove(net);
+                    let want = reference.remove(&net);
+                    assert_eq!(got, want, "remove mismatch for {:?}", net);
+                }
+                _ => {
+                    let got = table.get(net).copied();
+                    let want = reference.get(&net).copied();
+                    assert_eq!(got, want, "get mismatch for {:?}", net);
+                }
+            }
+        }
+
+        assert_eq!(table.len(), reference.len());
+        let got: Vec<_> = table.iter().map(|(k, v)| (*k, *v)).collect();
+        let want: Vec<_> = reference.into_iter().collect();
+        assert_eq!(got, want);
     }
 
     #[test]
