@@ -1,8 +1,8 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use ipnetwork::Ipv4Network;
 use iptable::Ipv4Table;
-use rand::{Rng, RngExt, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, RngExt, SeedableRng};
 
 fn random_ipnetwork<R: Rng>(rng: &mut R) -> Ipv4Network {
     let ip: std::net::Ipv4Addr = std::net::Ipv4Addr::new(

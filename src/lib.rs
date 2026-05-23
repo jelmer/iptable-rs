@@ -287,15 +287,19 @@ impl Subnet for IpNetwork {
     }
 }
 
+/// Index into the arena of trie nodes. `u32::MAX` is used as the `None` sentinel.
+type NodeId = u32;
+const NONE_ID: NodeId = u32::MAX;
+
 /// A node in the Patricia trie.
 ///
 /// `key` always has its network bits truncated to `key.prefix()` (= the node's depth).
 /// If `value` is `Some`, this node represents a stored entry; otherwise it is an
-/// internal branch node that must have both `children[0]` and `children[1]`.
+/// internal branch node that must have both children set to a valid `NodeId`.
 struct Node<N: Subnet, T> {
     key: N,
     value: Option<T>,
-    children: [Option<Box<Node<N, T>>>; 2],
+    children: [NodeId; 2],
 }
 
 impl<N: Subnet, T> Node<N, T> {
@@ -303,7 +307,7 @@ impl<N: Subnet, T> Node<N, T> {
         Self {
             key,
             value: Some(value),
-            children: [None, None],
+            children: [NONE_ID, NONE_ID],
         }
     }
 }
@@ -313,14 +317,24 @@ impl<N: Subnet, T> Node<N, T> {
 #[inline]
 fn first_diff_bit_prefix<N: Subnet>(a: N, b: N, to: u8) -> Option<u8> {
     let cpl = a.common_prefix_len(b);
-    if cpl >= to { None } else { Some(cpl) }
+    if cpl >= to {
+        None
+    } else {
+        Some(cpl)
+    }
 }
 
 /// Base structure for storing values by CIDR.
+///
+/// Nodes are arena-allocated in a single `Vec`: `Node::children` and `roots` use
+/// `NodeId` (= `u32`) indices into `nodes`. Removed slots are reused via `free`,
+/// so a long-lived table with churn doesn't grow unboundedly.
 pub struct GenericIpTable<N: Subnet, T> {
+    nodes: Vec<Node<N, T>>,
+    free: Vec<NodeId>,
     /// Separate subtries per address family — used so a single `IpTable`
     /// can hold both IPv4 and IPv6 entries while keeping each family's trie clean.
-    roots: [Option<Box<Node<N, T>>>; 2],
+    roots: [NodeId; 2],
     len: usize,
 }
 
@@ -346,7 +360,9 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     /// Create a new table.
     pub fn new() -> Self {
         Self {
-            roots: [None, None],
+            nodes: Vec::new(),
+            free: Vec::new(),
+            roots: [NONE_ID, NONE_ID],
             len: 0,
         }
     }
@@ -361,75 +377,129 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
         self.len == 0
     }
 
+    /// Allocate a node in the arena, reusing a freelist slot if available.
+    #[inline]
+    fn alloc(&mut self, node: Node<N, T>) -> NodeId {
+        if let Some(id) = self.free.pop() {
+            self.nodes[id as usize] = node;
+            id
+        } else {
+            let id = self.nodes.len() as u32;
+            self.nodes.push(node);
+            id
+        }
+    }
+
+    /// Mark a node slot as free, taking out its value (which is dropped) so the
+    /// slot holds a vacant placeholder until the next `alloc` overwrites it.
+    #[inline]
+    fn free_node(&mut self, id: NodeId) {
+        let n = &mut self.nodes[id as usize];
+        n.value = None;
+        n.children = [NONE_ID, NONE_ID];
+        self.free.push(id);
+    }
+
+    /// Set the child pointer at `(parent_id, bit)` to `child_id`, or if
+    /// `parent_id == NONE_ID`, set the root of `fam` instead.
+    #[inline]
+    fn set_link(&mut self, parent_id: NodeId, bit: usize, fam: usize, child_id: NodeId) {
+        if parent_id == NONE_ID {
+            self.roots[fam] = child_id;
+        } else {
+            self.nodes[parent_id as usize].children[bit] = child_id;
+        }
+    }
+
     /// Insert a value into the table.
     pub fn insert<S: Into<N>>(&mut self, net: S, value: T) {
         let net: N = net.into();
         let key = net.with_prefix_len(net.prefix());
+        let new_prefix = key.prefix();
         let fam = key.family() as usize;
-        let root = &mut self.roots[fam];
-        if root.is_none() {
-            *root = Some(Box::new(Node::new_leaf(key, value)));
-            self.len += 1;
-            return;
-        }
-        if Self::insert_into(root, key, value) {
-            self.len += 1;
+
+        let mut parent_id: NodeId = NONE_ID;
+        let mut parent_bit: usize = 0;
+        let mut cur_id = self.roots[fam];
+
+        loop {
+            if cur_id == NONE_ID {
+                let leaf = self.alloc(Node::new_leaf(key, value));
+                self.set_link(parent_id, parent_bit, fam, leaf);
+                self.len += 1;
+                return;
+            }
+            let node_key = self.nodes[cur_id as usize].key;
+            let node_prefix = node_key.prefix();
+            let cmp_to = node_prefix.min(new_prefix);
+            if let Some(diff) = first_diff_bit_prefix(node_key, key, cmp_to) {
+                // Split: branch at depth `diff`.
+                let branch_key = node_key.with_prefix_len(diff);
+                let leaf_id = self.alloc(Node::new_leaf(key, value));
+                let old_bit = node_key.bit_at(diff) as usize;
+                let new_bit = key.bit_at(diff) as usize;
+                debug_assert_ne!(old_bit, new_bit);
+                let mut branch = Node {
+                    key: branch_key,
+                    value: None,
+                    children: [NONE_ID, NONE_ID],
+                };
+                branch.children[old_bit] = cur_id;
+                branch.children[new_bit] = leaf_id;
+                let branch_id = self.alloc(branch);
+                self.set_link(parent_id, parent_bit, fam, branch_id);
+                self.len += 1;
+                return;
+            }
+            if new_prefix == node_prefix {
+                let slot = &mut self.nodes[cur_id as usize].value;
+                if slot.is_none() {
+                    self.len += 1;
+                }
+                *slot = Some(value);
+                return;
+            }
+            if new_prefix < node_prefix {
+                // New key is an ancestor of `cur`; insert a new node above it.
+                let bit = node_key.bit_at(new_prefix) as usize;
+                let mut new_node = Node::new_leaf(key, value);
+                new_node.children[bit] = cur_id;
+                let new_id = self.alloc(new_node);
+                self.set_link(parent_id, parent_bit, fam, new_id);
+                self.len += 1;
+                return;
+            }
+            // new_prefix > node_prefix: descend.
+            let bit = key.bit_at(node_prefix) as usize;
+            parent_id = cur_id;
+            parent_bit = bit;
+            cur_id = self.nodes[cur_id as usize].children[bit];
         }
     }
 
-    /// Insert into a non-empty subtree rooted at `slot`. Returns true if a new entry
-    /// was added (vs replacing an existing entry's value).
-    fn insert_into(slot: &mut Option<Box<Node<N, T>>>, key: N, value: T) -> bool {
-        let node = slot.as_mut().expect("non-empty slot");
-        let node_prefix = node.key.prefix();
-        let new_prefix = key.prefix();
-
-        // Find first bit where `key` and `node.key` differ within `[0, min(node_prefix, new_prefix))`.
-        let cmp_to = node_prefix.min(new_prefix);
-        if let Some(diff) = first_diff_bit_prefix(node.key, key, cmp_to) {
-            // Need to split: introduce a new branch node at depth `diff`.
-            let branch_key = node.key.with_prefix_len(diff);
-            let old = slot.take().unwrap();
-            let new_leaf = Box::new(Node::new_leaf(key, value));
-            let mut new_branch = Box::new(Node {
-                key: branch_key,
-                value: None,
-                children: [None, None],
-            });
-            let old_bit = old.key.bit_at(diff) as usize;
-            let new_bit = key.bit_at(diff) as usize;
-            debug_assert_ne!(old_bit, new_bit);
-            new_branch.children[old_bit] = Some(old);
-            new_branch.children[new_bit] = Some(new_leaf);
-            *slot = Some(new_branch);
-            return true;
+    /// Walk down to the node that exactly matches `key`, returning its id, or
+    /// `NONE_ID` if no such entry exists.
+    #[inline]
+    fn find_id(&self, key: N) -> NodeId {
+        let target_prefix = key.prefix();
+        let fam = key.family() as usize;
+        let mut cur = self.roots[fam];
+        while cur != NONE_ID {
+            let node = &self.nodes[cur as usize];
+            let np = node.key.prefix();
+            if np > target_prefix {
+                return NONE_ID;
+            }
+            if first_diff_bit_prefix(node.key, key, np).is_some() {
+                return NONE_ID;
+            }
+            if np == target_prefix {
+                return if node.value.is_some() { cur } else { NONE_ID };
+            }
+            let bit = key.bit_at(np) as usize;
+            cur = node.children[bit];
         }
-
-        // No divergence in the common prefix.
-        if new_prefix == node_prefix {
-            // Exact match on this node.
-            let was_empty = node.value.is_none();
-            node.value = Some(value);
-            return was_empty;
-        }
-
-        if new_prefix < node_prefix {
-            // The new key is an ancestor of `node`. Insert a new node above `node`.
-            let old = slot.take().unwrap();
-            let bit = old.key.bit_at(new_prefix) as usize;
-            let mut new_node = Box::new(Node::new_leaf(key, value));
-            new_node.children[bit] = Some(old);
-            *slot = Some(new_node);
-            return true;
-        }
-
-        // new_prefix > node_prefix: descend.
-        let bit = key.bit_at(node_prefix) as usize;
-        if node.children[bit].is_none() {
-            node.children[bit] = Some(Box::new(Node::new_leaf(key, value)));
-            return true;
-        }
-        Self::insert_into(&mut node.children[bit], key, value)
+        NONE_ID
     }
 
     /// Get a value from the table.
@@ -438,24 +508,12 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     pub fn get<S: Into<N>>(&self, net: S) -> Option<&T> {
         let key = net.into();
         let key = key.with_prefix_len(key.prefix());
-        let fam = key.family() as usize;
-        let mut cur = self.roots[fam].as_deref();
-        while let Some(node) = cur {
-            let np = node.key.prefix();
-            if np > key.prefix() {
-                return None;
-            }
-            // Bits [0, np) of node.key must equal bits [0, np) of key.
-            if first_diff_bit_prefix(node.key, key, np).is_some() {
-                return None;
-            }
-            if np == key.prefix() {
-                return node.value.as_ref();
-            }
-            let bit = key.bit_at(np) as usize;
-            cur = node.children[bit].as_deref();
+        let id = self.find_id(key);
+        if id == NONE_ID {
+            None
+        } else {
+            self.nodes[id as usize].value.as_ref()
         }
-        None
     }
 
     /// Get a mutable reference to a value in the table.
@@ -464,80 +522,132 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     pub fn get_mut<S: Into<N>>(&mut self, net: S) -> Option<&mut T> {
         let key = net.into();
         let key = key.with_prefix_len(key.prefix());
-        let fam = key.family() as usize;
-        let mut cur = self.roots[fam].as_deref_mut();
-        while let Some(node) = cur {
-            let np = node.key.prefix();
-            if np > key.prefix() {
-                return None;
-            }
-            if first_diff_bit_prefix(node.key, key, np).is_some() {
-                return None;
-            }
-            if np == key.prefix() {
-                return node.value.as_mut();
-            }
-            let bit = key.bit_at(np) as usize;
-            cur = node.children[bit].as_deref_mut();
+        let id = self.find_id(key);
+        if id == NONE_ID {
+            None
+        } else {
+            self.nodes[id as usize].value.as_mut()
         }
-        None
     }
 
     /// Remove a value from the table.
     pub fn remove<S: Into<N>>(&mut self, net: S) -> Option<T> {
         let key = net.into();
         let key = key.with_prefix_len(key.prefix());
+        let target_prefix = key.prefix();
         let fam = key.family() as usize;
-        let removed = Self::remove_from(&mut self.roots[fam], key);
-        if removed.is_some() {
-            self.len -= 1;
-        }
-        removed
-    }
 
-    fn remove_from(slot: &mut Option<Box<Node<N, T>>>, key: N) -> Option<T> {
-        let node = slot.as_mut()?;
-        let np = node.key.prefix();
-        if np > key.prefix() {
-            return None;
-        }
-        if first_diff_bit_prefix(node.key, key, np).is_some() {
-            return None;
-        }
-        if np == key.prefix() {
-            let removed = node.value.take();
-            if removed.is_some() {
-                Self::collapse(slot);
-            }
-            return removed;
-        }
-        let bit = key.bit_at(np) as usize;
-        let removed = Self::remove_from(&mut node.children[bit], key);
-        if removed.is_some() {
-            // After removing from child, current node may have only one child and no value.
-            Self::collapse(slot);
-        }
-        removed
-    }
-
-    /// Maintain the trie invariant: a node with no value must have two children.
-    /// If a node has no value and 0 or 1 children, remove or merge it.
-    fn collapse(slot: &mut Option<Box<Node<N, T>>>) {
-        let take_slot = |slot: &mut Option<Box<Node<N, T>>>| -> Option<Box<Node<N, T>>> {
-            let node = slot.as_ref()?;
-            if node.value.is_some() {
+        // Walk down, remembering the parent chain so we can collapse upwards
+        // after removing the leaf entry.
+        let mut parent_id: NodeId = NONE_ID;
+        let mut parent_bit: usize = 0;
+        let mut cur = self.roots[fam];
+        loop {
+            if cur == NONE_ID {
                 return None;
             }
-            let has0 = node.children[0].is_some();
-            let has1 = node.children[1].is_some();
-            if has0 && has1 {
+            let node = &self.nodes[cur as usize];
+            let np = node.key.prefix();
+            if np > target_prefix {
                 return None;
             }
-            slot.take()
+            if first_diff_bit_prefix(node.key, key, np).is_some() {
+                return None;
+            }
+            if np == target_prefix {
+                break;
+            }
+            let bit = key.bit_at(np) as usize;
+            parent_id = cur;
+            parent_bit = bit;
+            cur = node.children[bit];
+        }
+        let removed = self.nodes[cur as usize].value.take()?;
+        self.len -= 1;
+
+        // Collapse `cur` if it has 0 or 1 children.
+        let (c0, c1) = {
+            let n = &self.nodes[cur as usize];
+            (n.children[0], n.children[1])
         };
-        if let Some(mut node) = take_slot(slot) {
-            let child = node.children[0].take().or_else(|| node.children[1].take());
-            *slot = child;
+        if c0 == NONE_ID && c1 == NONE_ID {
+            // Leaf gone.
+            self.set_link(parent_id, parent_bit, fam, NONE_ID);
+            self.free_node(cur);
+            // Now the parent might be a branch with no value and only one child.
+            self.collapse_chain(fam);
+        } else if c0 == NONE_ID || c1 == NONE_ID {
+            // One child: replace cur with its only child.
+            let only = if c0 == NONE_ID { c1 } else { c0 };
+            self.set_link(parent_id, parent_bit, fam, only);
+            self.free_node(cur);
+        }
+        // else: cur still has both children — leave it as a value-less branch.
+
+        Some(removed)
+    }
+
+    /// After a leaf deletion, walk back along the parent chain (re-found by
+    /// descending the tree again — the path is short) and collapse any branch
+    /// nodes that now have no value and only one child.
+    ///
+    /// Because we already know which family to search and the path from root
+    /// is unique, the cheapest way to do this is to re-walk from the root and
+    /// remember parents on a small stack. The path is bounded by `addr_size()`,
+    /// so this is constant work.
+    fn collapse_chain(&mut self, fam: usize) {
+        // We rebuild the path of (parent_id, child_bit, node_id) from root down
+        // to the deepest node, then walk back up collapsing.
+        let mut path: Vec<(NodeId, usize, NodeId)> = Vec::with_capacity(32);
+        let mut parent_id: NodeId = NONE_ID;
+        let mut parent_bit: usize = 0;
+        let mut cur = self.roots[fam];
+        // Walk to a leaf along an arbitrary path — but we need to find branch
+        // nodes that have only one child *now*. Easier: traverse the whole
+        // subtree and collapse bottom-up. Since `remove` is the only caller
+        // and the cost is per-removal, traversing the whole family subtree is
+        // wasteful for large tables. Instead just walk down following the only
+        // possible chain of single-child branch nodes from the root.
+        while cur != NONE_ID {
+            path.push((parent_id, parent_bit, cur));
+            let (c0, c1) = {
+                let n = &self.nodes[cur as usize];
+                (n.children[0], n.children[1])
+            };
+            // Keep going while exactly one child exists.
+            if c0 != NONE_ID && c1 == NONE_ID {
+                parent_id = cur;
+                parent_bit = 0;
+                cur = c0;
+            } else if c1 != NONE_ID && c0 == NONE_ID {
+                parent_id = cur;
+                parent_bit = 1;
+                cur = c1;
+            } else {
+                break;
+            }
+        }
+        // Walk back up collapsing value-less branches with one child.
+        while let Some((p_id, p_bit, n_id)) = path.pop() {
+            let node = &self.nodes[n_id as usize];
+            if node.value.is_some() {
+                break;
+            }
+            let c0 = node.children[0];
+            let c1 = node.children[1];
+            if c0 != NONE_ID && c1 != NONE_ID {
+                break;
+            }
+            if c0 == NONE_ID && c1 == NONE_ID {
+                // Shouldn't happen for an internal value-less node (invariant),
+                // but handle defensively.
+                self.set_link(p_id, p_bit, fam, NONE_ID);
+                self.free_node(n_id);
+                continue;
+            }
+            let only = if c0 == NONE_ID { c1 } else { c0 };
+            self.set_link(p_id, p_bit, fam, only);
+            self.free_node(n_id);
         }
     }
 
@@ -553,7 +663,7 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
 
     /// Iterate over the entries in the table, ordered by prefix.
     pub fn iter(&self) -> Iter<'_, N, T> {
-        Iter::new(&self.roots)
+        Iter::new(self, [self.roots[0], self.roots[1]])
     }
 
     /// Iterate over the prefixes under the given prefix, including the prefix itself.
@@ -561,26 +671,24 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
         let prefix: N = prefix.into();
         let prefix = prefix.with_prefix_len(prefix.prefix());
         let fam = prefix.family() as usize;
-        // Walk to the deepest node that is `prefix` or a descendant of it (i.e. node.prefix() >= prefix.prefix()
-        // and node.key matches prefix on the first prefix.prefix() bits).
-        let mut cur = self.roots[fam].as_deref();
-        while let Some(node) = cur {
+        let target_prefix = prefix.prefix();
+        let mut cur = self.roots[fam];
+        while cur != NONE_ID {
+            let node = &self.nodes[cur as usize];
             let np = node.key.prefix();
-            if np >= prefix.prefix() {
-                // Check whether node lies under `prefix`.
-                if first_diff_bit_prefix(node.key, prefix, prefix.prefix()).is_none() {
-                    return Iter::from_subtree(Some(node));
+            if np >= target_prefix {
+                if first_diff_bit_prefix(node.key, prefix, target_prefix).is_none() {
+                    return Iter::from_subtree(self, cur);
                 }
-                return Iter::empty();
+                return Iter::empty(self);
             }
-            // np < prefix.prefix(): make sure first np bits agree, then descend.
             if first_diff_bit_prefix(node.key, prefix, np).is_some() {
-                return Iter::empty();
+                return Iter::empty(self);
             }
             let bit = prefix.bit_at(np) as usize;
-            cur = node.children[bit].as_deref();
+            cur = node.children[bit];
         }
-        Iter::empty()
+        Iter::empty(self)
     }
 
     /// Iterate over the prefixes under the given prefix, excluding the prefix itself.
@@ -628,27 +736,29 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     pub fn get_containing_prefix<S: Into<N>>(&self, net: S) -> Option<(N, &T)> {
         let key: N = net.into();
         let key = key.with_prefix_len(key.prefix());
+        let target_prefix = key.prefix();
         let fam = key.family() as usize;
-        let mut cur = self.roots[fam].as_deref();
+        let mut cur = self.roots[fam];
         let mut best: Option<(N, &T)> = None;
-        while let Some(node) = cur {
+        while cur != NONE_ID {
+            let node = &self.nodes[cur as usize];
             let np = node.key.prefix();
-            if np > key.prefix() {
+            if np > target_prefix {
                 break;
             }
             if first_diff_bit_prefix(node.key, key, np).is_some() {
                 break;
             }
             if let Some(v) = node.value.as_ref() {
-                if np < key.prefix() {
+                if np < target_prefix {
                     best = Some((node.key, v));
                 }
             }
-            if np == key.prefix() {
+            if np == target_prefix {
                 break;
             }
             let bit = key.bit_at(np) as usize;
-            cur = node.children[bit].as_deref();
+            cur = node.children[bit];
         }
         best
     }
@@ -657,18 +767,20 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     pub fn iter_containing_prefixes<S: Into<N>>(&self, net: S) -> ContainingPrefixes<'_, N, T> {
         let key: N = net.into();
         let key = key.with_prefix_len(key.prefix());
+        let target_prefix = key.prefix();
         let fam = key.family() as usize;
         let mut found: Vec<(N, &T)> = Vec::new();
-        let mut cur = self.roots[fam].as_deref();
-        while let Some(node) = cur {
+        let mut cur = self.roots[fam];
+        while cur != NONE_ID {
+            let node = &self.nodes[cur as usize];
             let np = node.key.prefix();
-            if np > key.prefix() {
+            if np > target_prefix {
                 break;
             }
             if first_diff_bit_prefix(node.key, key, np).is_some() {
                 break;
             }
-            if np < key.prefix() {
+            if np < target_prefix {
                 if let Some(v) = node.value.as_ref() {
                     found.push((node.key, v));
                 }
@@ -676,7 +788,7 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
                 break;
             }
             let bit = key.bit_at(np) as usize;
-            cur = node.children[bit].as_deref();
+            cur = node.children[bit];
         }
         found.reverse();
         ContainingPrefixes {
@@ -855,33 +967,39 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
 
 /// Iterator over the entries in a `GenericIpTable`, in `(network, prefix)` order.
 ///
-/// The stack holds nodes still to visit in pre-order: when a node is popped its value
-/// (if any) is yielded immediately, then its children are pushed in reverse order
-/// (right before left) so the left subtree is visited first.
+/// The stack holds node ids still to visit in pre-order: when an id is popped the
+/// corresponding node's value (if any) is yielded immediately, then its children
+/// are pushed in reverse order (right before left) so the left subtree is
+/// visited first.
 pub struct Iter<'a, N: Subnet, T> {
-    stack: Vec<&'a Node<N, T>>,
+    table: &'a GenericIpTable<N, T>,
+    stack: Vec<NodeId>,
 }
 
 impl<'a, N: Subnet, T> Iter<'a, N, T> {
-    fn new(roots: &'a [Option<Box<Node<N, T>>>; 2]) -> Self {
-        let mut stack: Vec<&'a Node<N, T>> = Vec::new();
+    fn new(table: &'a GenericIpTable<N, T>, roots: [NodeId; 2]) -> Self {
+        let mut stack = Vec::new();
         // Push in reverse so family 0 pops first.
-        for slot in roots.iter().rev() {
-            if let Some(root) = slot.as_deref() {
-                stack.push(root);
-            }
+        if roots[1] != NONE_ID {
+            stack.push(roots[1]);
         }
-        Self { stack }
+        if roots[0] != NONE_ID {
+            stack.push(roots[0]);
+        }
+        Self { table, stack }
     }
 
-    fn empty() -> Self {
-        Self { stack: Vec::new() }
+    fn empty(table: &'a GenericIpTable<N, T>) -> Self {
+        Self {
+            table,
+            stack: Vec::new(),
+        }
     }
 
-    fn from_subtree(node: Option<&'a Node<N, T>>) -> Self {
-        let mut it = Self::empty();
-        if let Some(node) = node {
-            it.stack.push(node);
+    fn from_subtree(table: &'a GenericIpTable<N, T>, root: NodeId) -> Self {
+        let mut it = Self::empty(table);
+        if root != NONE_ID {
+            it.stack.push(root);
         }
         it
     }
@@ -892,13 +1010,13 @@ impl<'a, N: Subnet, T> Iterator for Iter<'a, N, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let node = self.stack.pop()?;
-            // Push children right-then-left so left pops first.
-            if let Some(right) = node.children[1].as_deref() {
-                self.stack.push(right);
+            let id = self.stack.pop()?;
+            let node = &self.table.nodes[id as usize];
+            if node.children[1] != NONE_ID {
+                self.stack.push(node.children[1]);
             }
-            if let Some(left) = node.children[0].as_deref() {
-                self.stack.push(left);
+            if node.children[0] != NONE_ID {
+                self.stack.push(node.children[0]);
             }
             if let Some(v) = node.value.as_ref() {
                 return Some((&node.key, v));
@@ -952,10 +1070,12 @@ impl<'a, N: Subnet, T> Iterator for ContainingPrefixes<'a, N, T> {
 
 /// Owning iterator over `GenericIpTable`.
 ///
-/// Mirrors `Iter`: pop a node, yield its value (if any), push children right-then-left
-/// so the left subtree is visited first.
+/// Mirrors `Iter` but takes ownership: pop a node id, yield its value (if any)
+/// by `take`-ing it out of the arena, push children right-then-left so the
+/// left subtree is visited first.
 pub struct IntoIter<N: Subnet, T> {
-    stack: Vec<Box<Node<N, T>>>,
+    nodes: Vec<Node<N, T>>,
+    stack: Vec<NodeId>,
 }
 
 impl<N: Subnet, T> Iterator for IntoIter<N, T> {
@@ -963,15 +1083,20 @@ impl<N: Subnet, T> Iterator for IntoIter<N, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let mut node = self.stack.pop()?;
-            if let Some(right) = node.children[1].take() {
-                self.stack.push(right);
+            let id = self.stack.pop()?;
+            let node = &mut self.nodes[id as usize];
+            let c1 = node.children[1];
+            let c0 = node.children[0];
+            let v = node.value.take();
+            let key = node.key;
+            if c1 != NONE_ID {
+                self.stack.push(c1);
             }
-            if let Some(left) = node.children[0].take() {
-                self.stack.push(left);
+            if c0 != NONE_ID {
+                self.stack.push(c0);
             }
-            if let Some(v) = node.value.take() {
-                return Some((node.key, v));
+            if let Some(v) = v {
+                return Some((key, v));
             }
         }
     }
@@ -983,11 +1108,16 @@ impl<N: Subnet, T> IntoIterator for GenericIpTable<N, T> {
 
     fn into_iter(self) -> Self::IntoIter {
         let mut stack = Vec::new();
-        // Reverse so family 0 pops first.
-        for root in self.roots.into_iter().rev().flatten() {
-            stack.push(root);
+        if self.roots[1] != NONE_ID {
+            stack.push(self.roots[1]);
         }
-        IntoIter { stack }
+        if self.roots[0] != NONE_ID {
+            stack.push(self.roots[0]);
+        }
+        IntoIter {
+            nodes: self.nodes,
+            stack,
+        }
     }
 }
 
@@ -1070,7 +1200,12 @@ impl<'a, N: Subnet, T> VacantEntry<'a, N, T> {
 
 impl<N: Subnet, T> FromIterator<(N, T)> for GenericIpTable<N, T> {
     fn from_iter<I: IntoIterator<Item = (N, T)>>(iter: I) -> Self {
+        let iter = iter.into_iter();
         let mut table = Self::new();
+        let (lo, _) = iter.size_hint();
+        if lo > 0 {
+            table.nodes.reserve(lo);
+        }
         for (k, v) in iter {
             table.insert(k, v);
         }
