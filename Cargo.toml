@@ -8,8 +8,14 @@ authors = ["Jelmer Vernooĳ <jelmer@jelmer.uk>"]
 repository = "https://github.com/jelmer/iptable-rs"
 homepage = "https://github.com/jelmer/iptable-rs"
 
+[features]
+default = ["ipnetwork"]
+ipnetwork = ["dep:ipnetwork"]
+ipnet = ["dep:ipnet"]
+
 [dependencies]
-ipnetwork = "0.21.1"
+ipnetwork = { version = "0.21.1", optional = true }
+ipnet = { version = "2.9", optional = true }
 
 [dev-dependencies]
 criterion = { version = ">=0.5", features = ["html_reports"] }
@@ -19,3 +25,7 @@ rand = "0.10.1"
 name = "populate"
 path = "bench/populate.rs"
 harness = false
+required-features = ["ipnetwork"]
+
+[package.metadata.docs.rs]
+all-features = true

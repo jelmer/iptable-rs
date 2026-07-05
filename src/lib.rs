@@ -7,8 +7,19 @@
 //! the bits of the network address. Lookup, longest-prefix-match and gap operations all run
 //! in time proportional to the prefix length rather than the number of entries.
 //!
+//! # Feature flags
+//!
+//! IP network types come from either the [`ipnetwork`](https://crates.io/crates/ipnetwork)
+//! crate or the [`ipnet`](https://crates.io/crates/ipnet) crate, selected via Cargo
+//! features. `ipnetwork` is enabled by default. Both features can be enabled at
+//! the same time; the `IpTable`, `Ipv4Table` and `Ipv6Table` type aliases resolve
+//! to `ipnetwork` types when that feature is on, otherwise to `ipnet` types.
+//! Users who need the other crate's types can always use `GenericIpTable<N, T>`
+//! directly with any type implementing [`Subnet`].
+//!
 //! # Examples
 //! ```
+//! # #[cfg(feature = "ipnetwork")] {
 //! use iptable::Ipv4Table;
 //! use ipnetwork::Ipv4Network;
 //!
@@ -39,9 +50,10 @@
 //!     merged_table.iter().collect::<Vec<_>>(),
 //!     vec![(&"192.168.0.0/16".parse().unwrap(), &85)]
 //! );
+//! # }
 //! ```
 
-use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
+#[cfg(any(feature = "ipnetwork", feature = "ipnet"))]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// A trait for types that can be used as subnets.
@@ -89,6 +101,10 @@ pub trait Subnet: PartialOrd + Ord + PartialEq + Copy + std::fmt::Debug + std::h
     fn family(self) -> u8;
 }
 
+#[cfg(feature = "ipnetwork")]
+use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
+
+#[cfg(feature = "ipnetwork")]
 impl Subnet for Ipv4Network {
     type Address = Ipv4Addr;
 
@@ -149,6 +165,7 @@ impl Subnet for Ipv4Network {
     }
 }
 
+#[cfg(feature = "ipnetwork")]
 impl Subnet for Ipv6Network {
     type Address = Ipv6Addr;
 
@@ -209,6 +226,7 @@ impl Subnet for Ipv6Network {
     }
 }
 
+#[cfg(feature = "ipnetwork")]
 impl Subnet for IpNetwork {
     type Address = IpAddr;
 
@@ -287,6 +305,207 @@ impl Subnet for IpNetwork {
     }
 }
 
+#[cfg(feature = "ipnet")]
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+
+#[cfg(feature = "ipnet")]
+impl Subnet for Ipv4Net {
+    type Address = Ipv4Addr;
+
+    fn prefix(self) -> u8 {
+        Ipv4Net::prefix_len(&self)
+    }
+    fn last(self) -> Self {
+        let p = self.prefix_len();
+        let host_mask: u32 = if p == 0 { !0u32 } else { (!0u32) >> p };
+        let last = self.addr().to_bits() | host_mask;
+        Ipv4Net::new(Ipv4Addr::from_bits(last), p).unwrap()
+    }
+
+    fn is_subnet_of(self, other: Self) -> bool {
+        Ipv4Net::contains(&other, &self)
+    }
+
+    fn with_prefix_len(self, prefix: u8) -> Self {
+        assert!(prefix <= 32);
+        let mask: u32 = if prefix == 0 {
+            0
+        } else {
+            (!0u32) << (32 - prefix)
+        };
+        let ip = self.addr().to_bits() & mask;
+        Self::new(Ipv4Addr::from_bits(ip), prefix).unwrap()
+    }
+
+    fn toggle_bit(self, index: u8) -> Self {
+        let mut ip = self.addr().to_bits();
+        ip ^= 1 << (31 - index);
+        Self::new(Ipv4Addr::from_bits(ip), self.prefix_len()).unwrap()
+    }
+
+    fn addr_size(self) -> u8 {
+        32
+    }
+
+    fn network(self) -> Ipv4Addr {
+        Ipv4Net::network(&self)
+    }
+
+    fn bit_at(self, index: u8) -> bool {
+        (self.addr().to_bits() >> (31 - index)) & 1 != 0
+    }
+
+    fn common_prefix_len(self, other: Self) -> u8 {
+        let xor = self.addr().to_bits() ^ other.addr().to_bits();
+        if xor == 0 {
+            32
+        } else {
+            xor.leading_zeros() as u8
+        }
+    }
+
+    fn family(self) -> u8 {
+        0
+    }
+}
+
+#[cfg(feature = "ipnet")]
+impl Subnet for Ipv6Net {
+    type Address = Ipv6Addr;
+
+    fn prefix(self) -> u8 {
+        Ipv6Net::prefix_len(&self)
+    }
+    fn last(self) -> Self {
+        let p = self.prefix_len();
+        let host_mask: u128 = if p == 0 { !0u128 } else { (!0u128) >> p };
+        let last = self.addr().to_bits() | host_mask;
+        Ipv6Net::new(Ipv6Addr::from_bits(last), p).unwrap()
+    }
+
+    fn is_subnet_of(self, other: Self) -> bool {
+        Ipv6Net::contains(&other, &self)
+    }
+
+    fn with_prefix_len(self, prefix: u8) -> Self {
+        assert!(prefix <= 128);
+        let mask: u128 = if prefix == 0 {
+            0
+        } else {
+            (!0u128) << (128 - prefix)
+        };
+        let ip = self.addr().to_bits() & mask;
+        Self::new(Ipv6Addr::from_bits(ip), prefix).unwrap()
+    }
+
+    fn toggle_bit(self, index: u8) -> Self {
+        let mut ip = self.addr().to_bits();
+        ip ^= 1 << (127 - index);
+        Self::new(Ipv6Addr::from_bits(ip), self.prefix_len()).unwrap()
+    }
+
+    fn addr_size(self) -> u8 {
+        128
+    }
+
+    fn network(self) -> Ipv6Addr {
+        Ipv6Net::network(&self)
+    }
+
+    fn bit_at(self, index: u8) -> bool {
+        (self.addr().to_bits() >> (127 - index)) & 1 != 0
+    }
+
+    fn common_prefix_len(self, other: Self) -> u8 {
+        let xor = self.addr().to_bits() ^ other.addr().to_bits();
+        if xor == 0 {
+            128
+        } else {
+            xor.leading_zeros() as u8
+        }
+    }
+
+    fn family(self) -> u8 {
+        1
+    }
+}
+
+#[cfg(feature = "ipnet")]
+impl Subnet for IpNet {
+    type Address = IpAddr;
+
+    fn prefix(self) -> u8 {
+        match self {
+            IpNet::V4(net) => net.prefix_len(),
+            IpNet::V6(net) => net.prefix_len(),
+        }
+    }
+    fn last(self) -> Self {
+        match self {
+            IpNet::V4(net) => IpNet::V4(net.last()),
+            IpNet::V6(net) => IpNet::V6(net.last()),
+        }
+    }
+
+    fn is_subnet_of(self, other: Self) -> bool {
+        match (self, other) {
+            (IpNet::V4(net1), IpNet::V4(net2)) => net1.is_subnet_of(net2),
+            (IpNet::V6(net1), IpNet::V6(net2)) => net1.is_subnet_of(net2),
+            _ => false,
+        }
+    }
+
+    fn with_prefix_len(self, prefix: u8) -> Self {
+        match self {
+            IpNet::V4(net) => IpNet::V4(net.with_prefix_len(prefix)),
+            IpNet::V6(net) => IpNet::V6(net.with_prefix_len(prefix)),
+        }
+    }
+
+    fn toggle_bit(self, index: u8) -> Self {
+        match self {
+            IpNet::V4(net) => IpNet::V4(net.toggle_bit(index)),
+            IpNet::V6(net) => IpNet::V6(net.toggle_bit(index)),
+        }
+    }
+
+    fn addr_size(self) -> u8 {
+        match self {
+            IpNet::V4(_) => 32,
+            IpNet::V6(_) => 128,
+        }
+    }
+
+    fn network(self) -> IpAddr {
+        match self {
+            IpNet::V4(net) => IpAddr::V4(net.network()),
+            IpNet::V6(net) => IpAddr::V6(net.network()),
+        }
+    }
+
+    fn bit_at(self, index: u8) -> bool {
+        match self {
+            IpNet::V4(net) => net.bit_at(index),
+            IpNet::V6(net) => net.bit_at(index),
+        }
+    }
+
+    fn common_prefix_len(self, other: Self) -> u8 {
+        match (self, other) {
+            (IpNet::V4(a), IpNet::V4(b)) => a.common_prefix_len(b),
+            (IpNet::V6(a), IpNet::V6(b)) => a.common_prefix_len(b),
+            _ => 0,
+        }
+    }
+
+    fn family(self) -> u8 {
+        match self {
+            IpNet::V4(_) => 0,
+            IpNet::V6(_) => 1,
+        }
+    }
+}
+
 /// Index into the arena of trie nodes. `u32::MAX` is used as the `None` sentinel.
 type NodeId = u32;
 const NONE_ID: NodeId = u32::MAX;
@@ -339,16 +558,37 @@ pub struct GenericIpTable<N: Subnet, T> {
 }
 
 /// A table for storing values by IPv4 or IPv6 CIDR.
+///
+/// Uses `ipnetwork::IpNetwork` when the `ipnetwork` feature is enabled, else
+/// `ipnet::IpNet`.
+#[cfg(feature = "ipnetwork")]
 pub type IpTable<T> = GenericIpTable<IpNetwork, T>;
 
-/// Alias for IpTable
+/// A table for storing values by IPv4 or IPv6 CIDR.
+///
+/// Uses `ipnet::IpNet` because the `ipnetwork` feature is not enabled.
+#[cfg(all(feature = "ipnet", not(feature = "ipnetwork")))]
+pub type IpTable<T> = GenericIpTable<IpNet, T>;
+
+/// Alias for [`IpTable`].
+#[cfg(any(feature = "ipnetwork", feature = "ipnet"))]
 pub type UniversalIpTable<T> = IpTable<T>;
 
 /// A table for storing values by IPv4 CIDR.
+#[cfg(feature = "ipnetwork")]
 pub type Ipv4Table<T> = GenericIpTable<Ipv4Network, T>;
 
+/// A table for storing values by IPv4 CIDR.
+#[cfg(all(feature = "ipnet", not(feature = "ipnetwork")))]
+pub type Ipv4Table<T> = GenericIpTable<Ipv4Net, T>;
+
 /// A table for storing values by IPv6 CIDR.
+#[cfg(feature = "ipnetwork")]
 pub type Ipv6Table<T> = GenericIpTable<Ipv6Network, T>;
+
+/// A table for storing values by IPv6 CIDR.
+#[cfg(all(feature = "ipnet", not(feature = "ipnetwork")))]
+pub type Ipv6Table<T> = GenericIpTable<Ipv6Net, T>;
 
 impl<N: Subnet, T> Default for GenericIpTable<N, T> {
     fn default() -> Self {
@@ -724,6 +964,7 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     ///
     /// # Example
     /// ```
+    /// # #[cfg(feature = "ipnetwork")] {
     /// use iptable::IpTable;
     /// use ipnetwork::IpNetwork;
     /// let mut table = IpTable::new();
@@ -732,6 +973,7 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     /// assert_eq!(
     ///     table.get_containing_prefix(ip1),
     ///     Some(("192.168.2.0/24".parse().unwrap(), &42)));
+    /// # }
     /// ```
     pub fn get_containing_prefix<S: Into<N>>(&self, net: S) -> Option<(N, &T)> {
         let key: N = net.into();
@@ -814,6 +1056,7 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     ///
     /// # Example
     /// ```
+    /// # #[cfg(feature = "ipnetwork")] {
     /// use iptable::IpTable;
     /// use ipnetwork::IpNetwork;
     /// let mut table = IpTable::new();
@@ -826,6 +1069,7 @@ impl<N: Subnet, T> GenericIpTable<N, T> {
     ///     gaps, vec![
     ///         "192.168.16.0/20".parse().unwrap(),
     ///         "192.168.32.0/19".parse().unwrap()]);
+    /// # }
     /// ```
     pub fn gaps<S: Into<N>>(
         &self,
@@ -1308,7 +1552,7 @@ impl<N: Subnet, T: PartialEq> PartialEq for GenericIpTable<N, T> {
 
 impl<N: Subnet, T: Eq> Eq for GenericIpTable<N, T> {}
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ipnetwork"))]
 mod tests {
     use super::*;
     use std::net::IpAddr;
@@ -2032,5 +2276,52 @@ mod tests {
 
         let gaps = surrounding_gaps(parent, child, None).collect::<Vec<_>>();
         assert_eq!(gaps, vec!["192.168.2.0/25".parse().unwrap()]);
+    }
+}
+
+#[cfg(all(test, feature = "ipnet"))]
+mod tests_ipnet {
+    use super::*;
+
+    #[test]
+    fn test_ipv4_insert_get_remove() {
+        let mut table = GenericIpTable::<Ipv4Net, u32>::new();
+        let net: Ipv4Net = "192.168.0.0/24".parse().unwrap();
+        table.insert(net, 42);
+        assert_eq!(table.get(net), Some(&42));
+        table.remove(net);
+        assert_eq!(table.get(net), None);
+    }
+
+    #[test]
+    fn test_ipv6_insert_get() {
+        let mut table = GenericIpTable::<Ipv6Net, u32>::new();
+        let net: Ipv6Net = "2001:db8::/64".parse().unwrap();
+        table.insert(net, 7);
+        assert_eq!(table.get(net), Some(&7));
+    }
+
+    #[test]
+    fn test_ipnet_mixed_families() {
+        let mut table = GenericIpTable::<IpNet, u32>::new();
+        let v4: IpNet = "192.168.0.0/24".parse().unwrap();
+        let v6: IpNet = "2001:db8::/64".parse().unwrap();
+        table.insert(v4, 1);
+        table.insert(v6, 2);
+        assert_eq!(table.get(v4), Some(&1));
+        assert_eq!(table.get(v6), Some(&2));
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn test_longest_prefix_match() {
+        let mut table = GenericIpTable::<Ipv4Net, u32>::new();
+        table.insert("192.168.0.0/16".parse::<Ipv4Net>().unwrap(), 1);
+        table.insert("192.168.2.0/24".parse::<Ipv4Net>().unwrap(), 2);
+        let probe: Ipv4Net = "192.168.2.4/32".parse().unwrap();
+        assert_eq!(
+            table.get_containing_prefix(probe),
+            Some(("192.168.2.0/24".parse::<Ipv4Net>().unwrap(), &2))
+        );
     }
 }

@@ -26,3 +26,25 @@ assert_eq!(
     vec![(&"192.168.0.0/16".parse().unwrap(), &85)]
 );
 ```
+
+# Feature flags
+
+Network types come from either
+[`ipnetwork`](https://crates.io/crates/ipnetwork) (the default) or
+[`ipnet`](https://crates.io/crates/ipnet). Enable either or both:
+
+```toml
+# Default (ipnetwork)
+iptable = "0.3"
+
+# ipnet only
+iptable = { version = "0.3", default-features = false, features = ["ipnet"] }
+
+# Both
+iptable = { version = "0.3", features = ["ipnet"] }
+```
+
+The `IpTable`, `Ipv4Table` and `Ipv6Table` type aliases resolve to `ipnetwork`
+types when that feature is on, otherwise to `ipnet` types. To use the other
+crate's types, spell out `GenericIpTable<N, T>` with the desired `N`.
+
